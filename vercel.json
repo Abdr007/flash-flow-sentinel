@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/(.*)", "destination": "https://flash-flow-sentinel-production.up.railway.app/$1" }
+  ]
+}

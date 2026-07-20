@@ -1,0 +1,737 @@
+"use strict";
+/*
+ * FLASH FLOW SENTINEL
+ * ------------------------------------------------------------------------------------------------
+ * Real-time inflow/outflow monitor + outflow rate limits for every token traded on Flash V2
+ * (program FLASH6…, Solana mainnet). Defenses: an hourly outflow cap across all wallets,
+ * per-token caps, per-wallet concentration, vault drawdown velocity, failure spikes,
+ * and an independent Pyth cross-check of the protocol oracle.
+ *
+ * DATA HONESTY: every number is derived from real chain state —
+ *   • custodies + oracle marks: MagicBlock mainnet ER, program's own on-chain IDL
+ *   • flow events: real base-chain transactions (exact u64 vault deltas from pre/post balances)
+ *   • vault balances: base-chain SPL token accounts, raw u64
+ *   • cross-check prices: Pyth Lazer (direct with token, else the Flash V2 API Lazer feed)
+ * A live flow-conservation proof (baseline + Σ deltas == current balance, raw u64) is computed
+ * per vault every cycle, so the dashboard can PROVE it hasn't missed a transfer.
+ */
+const fs = require("fs");
+const path = require("path");
+const http = require("http");
+const { makeRpc } = require("./lib/rpc.cjs");
+const { PROG, scanCustodies, scanMarkets, scanNamedVaults, describeVault, sweepAuthority, fetchMarks, fetchVaultBalances } = require("./lib/custodies.cjs");
+const { newSignatures, decodeFlow, classify } = require("./lib/flows.cjs");
+const { fetchLazerMeta, fetchLazerLatest } = require("./lib/lazer.cjs");
+const { fetchFlashLazerPrices, fetchFlashLazerIds } = require("./lib/flashprices.cjs");
+const { DEFAULT_LIMITS, evaluate, ruleStates, hourlyBucketsBySide } = require("./lib/limits.cjs");
+const { fetchGovernance, diffGovernance, mergeGovernance } = require("./lib/authority.cjs");
+const { deliverAlert, heartbeat, sendTelegram, sendOperator, channelsConfigured } = require("./lib/notify.cjs");
+
+// ---------------- config ----------------
+const ER_URL = process.env.ER_URL || "https://flashtrade.magicblock.app";
+const MAIN_URL = process.env.RPC_URL || (process.env.HELIUS_KEY ? `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_KEY}` : "https://api.mainnet-beta.solana.com");
+const POLL_MS = Number(process.env.POLL_MS || 12000);
+const DIGEST_INTERVAL_S = Number(process.env.DIGEST_INTERVAL_S || 86400); // daily status digest to the channel
+const WEEKLY_INTERVAL_S = Number(process.env.WEEKLY_INTERVAL_S || 604800); // weekly deep-dive post
+const CUSTODY_REFRESH_MS = Number(process.env.CUSTODY_REFRESH_MS || 600000);
+const BACKFILL_HOURS = Number(process.env.BACKFILL_HOURS || 24);
+const RETENTION_HOURS = Number(process.env.RETENTION_HOURS || 48);
+const PORT = Number(process.env.PORT || 4646);
+// On a hosting platform ($PORT is injected) bind all interfaces; locally stay on loopback.
+const HOST = process.env.HOST || (process.env.PORT ? "0.0.0.0" : "127.0.0.1");
+
+const DATA = path.join(__dirname, "data");
+const F_EVENTS = path.join(DATA, "events.jsonl");
+const F_STATE = path.join(DATA, "state.json");
+const F_LIMITS = path.join(DATA, "limits.json");
+const F_ALERTS = path.join(DATA, "alerts.jsonl");
+
+const er = makeRpc(ER_URL, { minGapMs: 150 });
+const main = makeRpc(MAIN_URL, { minGapMs: 130 });
+const now = () => Math.floor(Date.now() / 1000);
+const redact = (u) => { try { const x = new URL(u); return x.hostname; } catch (e) { return "?"; } };
+const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
+
+// ---------------- state ----------------
+const S = {
+  startedAt: now(),
+  custodies: [], pools: 0, erSlot: null,
+  markets: [],               // every Market account on the ER (full traded universe)
+  named: [],                 // TradeVault / RebateVault / TokenVault descriptors (custody-shaped)
+  dynamic: {},               // ta → descriptor: authority-swept accounts promoted on first movement
+  sweepBal: {},              // ta → last seen raw balance for ALL authority-owned token accounts
+  authority: null,           // the program's vault authority PDA (read from chain)
+  marks: {},                 // custody → mark USD (on-chain CustomOracle)
+  markTimes: {},             // custody → CustomOracle publish_time (unix) — proves staleness
+  balances: {},              // vault → BigInt | null
+  vaultState: {},            // vault → { lastSig }
+  events: [],                // ascending blockTime, retained window
+  eventKeys: new Set(),      // `${vault}:${sig}` dedupe
+  failures: [],              // { vault, sig, blockTime }
+  conservation: {},          // vault → { baseRaw, baseTime, sumDeltas, residual, streak, status, rebases }
+  governance: null,          // live governance snapshot (upgrade auth, multisig, permissions)
+  govBaseline: null,         // last-good full governance snapshot for change detection (persisted)
+  govChanges: [],            // recorded governance changes (also alerts)
+  lastDigestUnix: 0,         // last daily-digest broadcast (persisted; survives restarts)
+  lastWeeklyUnix: 0,         // last weekly deep-dive broadcast (persisted)
+  pyth: { feeds: {}, prices: {}, source: "flash-api" },
+  flashLazerIds: {},         // symbol → official Lazer feed id (from flashapi /tokens)
+  lazerIds: {},              // custody → on-chain lazer_feed_id
+  lazer: { token: process.env.LAZER_ACCESS_TOKEN || null, meta: {}, ok: false, reason: null },
+  limits: { ...DEFAULT_LIMITS },
+  alertsActive: {},          // ruleKey → { status, detail, since }
+  alertsLog: [],             // recent transitions (also appended to alerts.jsonl)
+  lastCycle: null, cycleSeconds: null, cycleErrors: [], cycles: 0,
+  sse: new Set(),
+};
+
+// ---------------- persistence ----------------
+function loadLimits() {
+  try { S.limits = { ...DEFAULT_LIMITS, ...JSON.parse(fs.readFileSync(F_LIMITS, "utf8")) }; }
+  catch (e) { fs.writeFileSync(F_LIMITS, JSON.stringify(DEFAULT_LIMITS, null, 2)); }
+}
+function saveLimits() { fs.writeFileSync(F_LIMITS, JSON.stringify(S.limits, null, 2)); }
+function loadState() {
+  try {
+    const j = JSON.parse(fs.readFileSync(F_STATE, "utf8"));
+    S.vaultState = j.vaultState || {};
+    S.alertsActive = j.alertsActive || {};   // don't re-fire alerts that were already active
+    S.alertsLog = j.alertsLog || [];
+    S.sweepBal = j.sweepBal || {};           // so movements during downtime are still caught
+    S.dynamic = j.dynamic || {};             // promoted accounts stay fully tracked
+    S.govBaseline = j.govBaseline || null;   // detect governance changes across restarts too
+    S.govChanges = j.govChanges || [];
+    S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
+    S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
+    S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
+  } catch (e) {}
+}
+function saveState() {
+  fs.writeFileSync(F_STATE, JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2));
+}
+function loadEvents() {
+  const cutoff = now() - RETENTION_HOURS * 3600;
+  let lines = [];
+  try { lines = fs.readFileSync(F_EVENTS, "utf8").split("\n").filter(Boolean); } catch (e) { return; }
+  for (const ln of lines) {
+    try {
+      const e = JSON.parse(ln);
+      if (e.blockTime == null || e.blockTime < cutoff) continue;
+      const k = e.custody + ":" + e.sig;
+      if (S.eventKeys.has(k)) continue;
+      S.eventKeys.add(k); S.events.push(e);
+    } catch (err) {}
+  }
+  S.events.sort((a, b) => a.blockTime - b.blockTime);
+  // rotate the file down to the retained window if it has grown
+  if (lines.length > S.events.length * 2 || (fs.existsSync(F_EVENTS) && fs.statSync(F_EVENTS).size > 25e6)) {
+    fs.writeFileSync(F_EVENTS, S.events.map((e) => JSON.stringify(e)).join("\n") + (S.events.length ? "\n" : ""));
+  }
+  log(`loaded ${S.events.length} retained events from disk`);
+}
+function appendEvent(e) { fs.appendFileSync(F_EVENTS, JSON.stringify(e) + "\n"); }
+function appendAlert(a) { fs.appendFileSync(F_ALERTS, JSON.stringify(a) + "\n"); }
+function pruneMemory() {
+  const cutoff = now() - RETENTION_HOURS * 3600;
+  while (S.events.length && S.events[0].blockTime < cutoff) { const e = S.events.shift(); S.eventKeys.delete(e.custody + ":" + e.sig); }
+  S.failures = S.failures.filter((f) => f.blockTime >= cutoff);
+  if (S.alertsLog.length > 500) S.alertsLog = S.alertsLog.slice(-500);
+}
+
+// ---------------- alerts ----------------
+function fireWebhook(a) {
+  // fan out to every configured channel (generic webhook + Telegram + Slack)
+  deliverAlert(a, { webhookUrl: S.limits.webhookUrl });
+}
+function processAlertTransitions(ev) {
+  const next = ruleStates(ev);
+  const t = now();
+  for (const [key, st] of Object.entries(next)) {
+    const prev = S.alertsActive[key];
+    if (!prev) {
+      S.alertsActive[key] = { ...st, since: t };
+      if (st.status !== "ok") { // never log/webhook a rule that starts green
+        const a = { time: t, rule: key, from: "ok", to: st.status, detail: st.detail };
+        S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a });
+        log(`ALERT ${st.status.toUpperCase()} ${key} — ${st.detail}`);
+      }
+    } else if (prev.status !== st.status) {
+      const a = { time: t, rule: key, from: prev.status, to: st.status, detail: st.detail };
+      S.alertsActive[key] = { ...st, since: prev.since };
+      S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a });
+      log(`ALERT ${prev.status}→${st.status} ${key} — ${st.detail}`);
+    } else {
+      S.alertsActive[key].detail = st.detail;
+    }
+  }
+  for (const key of Object.keys(S.alertsActive)) {
+    if (key.startsWith("gov:")) continue; // governance changes are latched — cleared only by human ack
+    if (!next[key]) {
+      const a = { time: t, rule: key, from: S.alertsActive[key].status, to: "ok", detail: "resolved" };
+      delete S.alertsActive[key];
+      S.alertsLog.push(a); appendAlert(a); fireWebhook(a);
+      log(`ALERT resolved ${key}`);
+    }
+  }
+}
+
+// ---------------- daily status digest (broadcast to the channel) ----------------
+const money = (n) => { const a = Math.abs(n || 0); const s = (n || 0) < 0 ? "-" : ""; return a >= 1e6 ? s + "$" + (a / 1e6).toFixed(2) + "M" : a >= 1e3 ? s + "$" + (a / 1e3).toFixed(1) + "k" : s + "$" + a.toFixed(0); };
+function composeDigest() {
+  const ev = S.lastEval, g = ev && ev.global, gv = S.governance;
+  const consEx = Object.values(S.conservation).filter((c) => c.status === "exact").length, consN = Object.keys(S.conservation).length;
+  const tokBad = ev ? ev.tokens.filter((t) => t.status !== "ok").length : 0;
+  const walBad = ev ? ev.wallets.filter((w) => w.status !== "ok").length : 0;
+  const oraBad = ev ? ev.oracle.filter((o) => o.status === "breach").length : 0;
+  const govChg = gv && gv.changes ? gv.changes.length : 0;
+  const allGreen = g && g.status === "ok" && !tokBad && !walBad && !oraBad && !govChg;
+  const tr = ev && ev.sides.find((s) => s.side === "trade"), lp = ev && ev.sides.find((s) => s.side === "lp");
+  const oraLive = ev ? ev.oracle.filter((o) => o.deviationPct != null) : [];
+  const worst = oraLive.length ? oraLive.reduce((a, b) => (b.deviationPct > a.deviationPct ? b : a)) : null;
+  const tvl = ev ? ev.tokens.reduce((s, t) => s + (t.vaultUsd || 0), 0) : 0;
+  const L = [];
+  L.push(`📊 FLASH FLOW SENTINEL — Daily Status`);
+  L.push(``);
+  L.push(allGreen ? `✅ All flow guards GREEN` : `⚠️ ${[g && g.status !== "ok" ? "global cap" : null, tokBad ? tokBad + " token" : null, walBad ? walBad + " wallet" : null, oraBad ? oraBad + " oracle" : null, govChg ? govChg + " governance" : null].filter(Boolean).join(", ")} tripped`);
+  L.push(`🏦 ${S.custodies ? tracked().length : 0} vaults · TVL ${money(tvl)} · conservation ${consEx}/${consN} exact`);
+  if (g) L.push(`💵 24h flow: ▲ ${money(g.in24hUsd)} in · ▼ ${money(g.out24hUsd)} out (net ${money(g.in24hUsd - g.out24hUsd)})`);
+  if (tr && lp) L.push(`📈 Trade ▲${money(tr.in24hUsd)}/▼${money(tr.out24hUsd)} · LP ▲${money(lp.in24hUsd)}/▼${money(lp.out24hUsd)}`);
+  L.push(`🔮 Oracle: ${oraLive.length} feeds checked${worst ? ` · worst ${worst.symbol} ${worst.deviationPct}% vs Lazer` : ""}`);
+  L.push(`🛡️ Governance: ${govChg ? "⚠️ " + govChg + " change(s)" : "stable"} · Squads ${process.env.SQUADS_MOFN || "3-of-7"} multisig-gated upgrades`);
+  L.push(``);
+  L.push(`🔗 flash-flow-sentinel.vercel.app`);
+  return L.join("\n");
+}
+function maybeSendDigest() {
+  if (!S.lastEval) return; // wait until we have a real evaluation
+  const t = now();
+  if (t - (S.lastDigestUnix || 0) < DIGEST_INTERVAL_S) return;
+  S.lastDigestUnix = t;
+  sendTelegram(composeDigest());
+  log(`digest broadcast to channel`);
+}
+
+// ---------------- weekly deep-dive (richer analytics broadcast) ----------------
+const shortAddr = (a) => (a ? a.slice(0, 4) + "…" + a.slice(-4) : "—");
+function composeWeekly() {
+  const ev = S.lastEval, gv = S.governance;
+  const wk = now() - 7 * 86400;
+  // the week's guard record from the persisted alert log
+  const wkLog = (S.alertsLog || []).filter((a) => a.time >= wk);
+  const breaches = wkLog.filter((a) => a.to === "breach" && !a.rule.startsWith("gov:")).length;
+  const warns = wkLog.filter((a) => a.to === "warn").length;
+  const govEvents = (S.govChanges || []).filter((a) => a.time >= wk);
+  const deploys = govEvents.filter((a) => a.rule === "gov:program-deploy").length;
+  const activeNow = Object.values(S.alertsActive || {}).filter((a) => a.status === "warn" || a.status === "breach").length;
+
+  const tokens = (ev && ev.tokens) || [];
+  const topOut = [...tokens].filter((t) => t.out24hUsd > 0).sort((a, b) => b.out24hUsd - a.out24hUsd).slice(0, 3);
+  const topBal = [...tokens].sort((a, b) => (b.vaultUsd || 0) - (a.vaultUsd || 0))[0];
+  const wallets = ((ev && ev.wallets) || []).filter((w) => w.out24hUsd > 0).slice(0, 3);
+  const tr = ev && ev.sides.find((s) => s.side === "trade"), lp = ev && ev.sides.find((s) => s.side === "lp"), stk = ev && ev.sides.find((s) => s.side === "staking");
+  const oraLive = ev ? ev.oracle.filter((o) => o.deviationPct != null) : [];
+  const worst = oraLive.length ? oraLive.reduce((a, b) => (b.deviationPct > a.deviationPct ? b : a)) : null;
+  const idle = ev ? ev.oracle.filter((o) => o.status === "inactive").length : 0;
+  const consRows = Object.values(S.conservation);
+  const consEx = consRows.filter((c) => c.status === "exact").length, drift = consRows.filter((c) => c.status === "drift").length;
+  const tvl = tokens.reduce((s, t) => s + (t.vaultUsd || 0), 0);
+
+  const L = [];
+  L.push(`📈 FLASH FLOW SENTINEL — Weekly Deep Dive`);
+  L.push(``);
+  L.push(`🛡️ 7-day guard record`);
+  L.push(breaches || warns ? `   ${breaches} breach · ${warns} warn fired${activeNow ? ` · ${activeNow} active now` : " · all resolved"}` : `   clean week — every guard held green`);
+  L.push(`   Governance: ${govEvents.length ? govEvents.length + " change(s)" : "no changes"}${deploys ? ` · ${deploys} redeploy(s) tracked` : ""} · Squads ${process.env.SQUADS_MOFN || "3-of-7"} multisig`);
+  L.push(``);
+  L.push(`💰 Flow leaders (24h)`);
+  if (topOut.length) L.push(`   Vaults ▼out: ${topOut.map((t, i) => `${i + 1}. ${t.pool}/${t.symbol} ${money(t.out24hUsd)}`).join(" · ")}`);
+  if (wallets.length) L.push(`   Wallets ▼out: ${wallets.map((w, i) => `${i + 1}. ${shortAddr(w.wallet)} ${money(w.out24hUsd)}`).join(" · ")}`);
+  L.push(``);
+  if (tr && lp) L.push(`📊 Sides (24h): Trade ▲${money(tr.in24hUsd)}/▼${money(tr.out24hUsd)} · LP ▲${money(lp.in24hUsd)}/▼${money(lp.out24hUsd)}${stk && (stk.in24hUsd || stk.out24hUsd) ? ` · Staking ▲${money(stk.in24hUsd)}/▼${money(stk.out24hUsd)}` : ""}`);
+  L.push(`🏦 ${tracked().length} vaults · TVL ${money(tvl)}${topBal ? ` · biggest ${topBal.symbol} ${money(topBal.vaultUsd)}` : ""}`);
+  L.push(`🔮 Oracle: ${oraLive.length} live feeds${worst ? ` · worst ${worst.symbol} ${worst.deviationPct}%` : ""}${idle ? ` · ${idle} idle (paused/closed)` : ""}`);
+  L.push(`✅ Conservation: ${consEx}/${consRows.length} exact · ${drift} unresolved drift`);
+  L.push(``);
+  L.push(`🔗 flash-flow-sentinel.vercel.app`);
+  return L.join("\n");
+}
+function maybeSendWeekly() {
+  if (!S.lastEval) return;
+  const t = now();
+  if (t - (S.lastWeeklyUnix || 0) < WEEKLY_INTERVAL_S) return;
+  S.lastWeeklyUnix = t;
+  sendTelegram(composeWeekly());
+  log(`weekly deep-dive broadcast to channel`);
+}
+
+// ---------------- core cycle ----------------
+async function refreshCustodies() {
+  const { custodies, pools, erSlot } = await scanCustodies(er);
+  if (custodies.length) { S.custodies = custodies; S.pools = pools; S.erSlot = erSlot; }
+}
+const realC = () => S.custodies.filter((c) => !c.isVirtual); // custodies that own SPL vaults
+const tracked = () => [...realC(), ...S.named, ...Object.values(S.dynamic)]; // every fully-tracked vault
+const allDescriptors = () => [...S.custodies, ...S.named, ...Object.values(S.dynamic)];
+
+/** Authority sweep: watch the balance of EVERY token account owned by the program's vault
+ *  authority (2 RPC calls). Any untracked account that moves is promoted to full per-tx
+ *  tracking and its window is immediately decoded — nothing under the authority can flow
+ *  unobserved. */
+async function runSweep(cutoff) {
+  if (!S.authority) return 0;
+  const sw = await sweepAuthority(main, S.authority);
+  if (!Object.keys(sw).length) return 0;
+  const trackedVaults = new Set(tracked().map((c) => c.vault));
+  let promoted = 0;
+  for (const [ta, info] of Object.entries(sw)) {
+    const prev = S.sweepBal[ta];
+    if (!trackedVaults.has(ta) && prev != null && prev !== info.amountRaw) {
+      const desc = describeVault({ pda: ta, pool: "Authority", ta, mint: info.mint, kind: "swept" }, S.custodies, info);
+      S.dynamic[ta] = desc; promoted++;
+      log(`SWEEP: promoted ${desc.symbol} ${ta.slice(0, 8)}… to full tracking (balance ${prev} → ${info.amountRaw})`);
+      try { await pollVault(desc, cutoff); } catch (e) { S.cycleErrors.push(`sweep ${desc.symbol}: ${e.message}`); }
+    }
+    S.sweepBal[ta] = info.amountRaw;
+  }
+  return promoted;
+}
+
+async function pollVault(cust, cutoff) {
+  const vs = S.vaultState[cust.vault] || (S.vaultState[cust.vault] = { lastSig: null });
+  const { sigs, failed } = await newSignatures(main, cust.vault, vs.lastSig, cutoff);
+  for (const f of failed) if (!S.failures.some((x) => x.sig === f.sig)) S.failures.push({ vault: cust.vault, sig: f.sig, blockTime: f.blockTime });
+  const fresh = [];
+  for (const s of sigs) {
+    const k = cust.custody + ":" + s.signature;
+    if (S.eventKeys.has(k)) continue;
+    try {
+      const e = await decodeFlow(main, s, cust, S.marks[cust.custody]);
+      if (e) {
+        S.eventKeys.add(k); S.events.push(e); appendEvent(e); fresh.push(e);
+        const c = S.conservation[cust.vault];
+        if (c) c.sumDeltas = (BigInt(c.sumDeltas) + BigInt(e.deltaRaw)).toString();
+      } else {
+        S.eventKeys.add(k); // confirmed tx that didn't move the vault — remember, don't refetch
+      }
+    } catch (err) {
+      S.cycleErrors.push(`decode ${s.signature.slice(0, 12)}…: ${err.message}`);
+      break; // don't advance lastSig past an undecoded tx
+    }
+  }
+  // advance lastSig only through the fully processed prefix (an undecoded tx is retried next cycle)
+  let processedThrough = null;
+  for (const s of sigs) { if (S.eventKeys.has(cust.custody + ":" + s.signature)) processedThrough = s.signature; else break; }
+  if (processedThrough) vs.lastSig = processedThrough;
+  return fresh.length;
+}
+
+function checkConservation() {
+  const t = now();
+  for (const cust of tracked()) {
+    const bal = S.balances[cust.vault];
+    if (bal == null) continue;
+    let c = S.conservation[cust.vault];
+    if (!c) { S.conservation[cust.vault] = { baseRaw: bal.toString(), baseTime: t, sumDeltas: "0", residual: "0", streak: 0, status: "exact", rebases: 0 }; continue; }
+    const expect = BigInt(c.baseRaw) + BigInt(c.sumDeltas);
+    const residual = bal - expect;
+    c.residual = residual.toString();
+    if (residual === 0n) { c.status = "exact"; c.streak = 0; }
+    else {
+      c.streak++;
+      if (c.streak <= 2) c.status = "syncing"; // a transfer can land between the sig scan and the balance read
+      else {
+        c.status = "drift";
+        const a = { time: t, rule: `conservation:${cust.pool}/${cust.symbol}`, from: "exact", to: "drift", detail: `residual ${residual} raw — rebasing baseline` };
+        S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a });
+        log(`CONSERVATION DRIFT ${cust.pool}/${cust.symbol} residual=${residual}`);
+        c.baseRaw = bal.toString(); c.baseTime = t; c.sumDeltas = "0"; c.streak = 0; c.rebases++;
+      }
+    }
+  }
+}
+
+// ---------------- governance & authority watch ----------------
+// Reads the full authority surface (upgrade authority, program deploys, admin multisig,
+// global permission flags) and alerts the instant any of it changes — the precursor step
+// of the drain kill-chain, ahead of any money movement.
+async function checkGovernance() {
+  let fresh;
+  try { fresh = await fetchGovernance(main, er); }
+  catch (e) { S.cycleErrors.push("governance: " + e.message); return; }
+  if (!fresh) return;
+  const t = now();
+  const prev = S.govBaseline; // full prior snapshot (persisted across restarts)
+  // carry-forward: any section that failed to read keeps its last-good value → a transient RPC
+  // gap can neither raise a false change nor blind a later real change on that section.
+  const gov = mergeGovernance(prev, fresh);
+  S.governance = gov;
+  if (!prev) { S.govBaseline = gov; return; }             // first observation → baseline, no alert
+  if (prev.fingerprint === gov.fingerprint) { S.govBaseline = gov; return; }
+
+  const changes = diffGovernance(prev, gov);
+  if (!changes.length) { S.govBaseline = gov; return; }   // fingerprint moved only on a skipped section → no wolf
+  for (const ch of changes) {
+    const a = { time: t, rule: ch.key, from: "ok", to: "breach", severity: ch.severity, detail: ch.detail };
+    S.govChanges.push(a); S.alertsActive[ch.key] = { status: "breach", detail: ch.detail, since: t };
+    S.alertsLog.push(a); appendAlert(a); fireWebhook(a);
+    log(`GOVERNANCE ${ch.severity.toUpperCase()} ${ch.key} — ${ch.detail}`);
+  }
+  S.govBaseline = gov;
+}
+
+// ---------------- realtime push: WebSocket accountSubscribe on every vault ----------------
+// Any balance change on any custody vault triggers an immediate decode cycle (~1s after the
+// block) instead of waiting for the next poll. Baseline polling remains the safety net.
+let ws = null, wsVaults = "", wsUp = false, fastTimer = null;
+function triggerFastCycle() {
+  if (fastTimer) return;
+  fastTimer = setTimeout(() => { fastTimer = null; cycle("ws"); }, 1200);
+}
+function connectWs() {
+  if (typeof WebSocket === "undefined") { log("WS: no WebSocket in this Node — push trigger disabled"); return; }
+  const rc = tracked();
+  const vaults = rc.map((c) => c.vault).sort().join(",");
+  wsVaults = vaults;
+  try { if (ws) { ws.onclose = null; ws.close(); } } catch (e) {}
+  try {
+    ws = new WebSocket(MAIN_URL.replace(/^https/, "wss").replace(/^http/, "ws"));
+    ws.onopen = () => {
+      wsUp = true;
+      rc.forEach((c, i) => ws.send(JSON.stringify({ jsonrpc: "2.0", id: i + 1, method: "accountSubscribe", params: [c.vault, { encoding: "base64", commitment: "confirmed" }] })));
+      log(`WS: subscribed to ${rc.length} vault accounts (push-triggered capture)`);
+    };
+    ws.onmessage = (m) => { try { const j = JSON.parse(m.data); if (j.method === "accountNotification") triggerFastCycle(); } catch (e) {} };
+    ws.onclose = () => { wsUp = false; setTimeout(connectWs, 5000); };
+    ws.onerror = () => { try { ws.close(); } catch (e) {} };
+  } catch (e) { wsUp = false; log("WS: " + e.message); }
+}
+
+
+// ---------------- independent price source: Pyth Lazer (Flash's own feed service, mapped by
+// each oracle's on-chain lazer_feed_id) when LAZER_ACCESS_TOKEN is set; else the Flash V2 API Lazer feed. ----
+async function refreshIndependentPrices() {
+  // 1) direct Pyth Lazer (third-party independent) when LAZER_ACCESS_TOKEN is configured
+  if (S.lazer.token) {
+    try {
+      if (!Object.keys(S.lazer.meta).length) S.lazer.meta = await fetchLazerMeta();
+      const idBySym = {};
+      for (const c of S.custodies) { const id = S.lazerIds[c.custody]; if (id && !(c.symbol in idBySym)) idBySym[c.symbol] = id; }
+      const ids = [...new Set(Object.values(idBySym))];
+      const lp = await fetchLazerLatest(ids, S.lazer.token, S.lazer.meta);
+      const feeds = {}, prices = {};
+      for (const [sym, id] of Object.entries(idBySym)) {
+        const m = S.lazer.meta[id];
+        feeds[sym] = { id, pythSymbol: (m && m.symbol) || ("lazer#" + id), source: "lazer" };
+        if (lp[id]) prices[sym] = lp[id];
+      }
+      if (Object.keys(prices).length) {
+        S.pyth = { feeds, prices, source: "lazer" };
+        if (!S.lazer.ok) log(`oracle guard source → PYTH LAZER direct (${Object.keys(prices).length} feeds, on-chain feed ids)`);
+        S.lazer.ok = true; S.lazer.reason = null;
+        return;
+      }
+      throw new Error("lazer returned no usable prices");
+    } catch (e) {
+      if (S.lazer.ok || !S.lazer.reason) log(`lazer direct unavailable (${e.message}) — using Flash API Lazer feed`);
+      S.lazer.ok = false; S.lazer.reason = e.message;
+    }
+  }
+  // 2) Flash V2 API /prices — Flash's Lazer-fed price service (flashapi.trade, documented).
+  //    A different system from the on-chain oracle writer: a forged mark diverges instantly.
+  try {
+    const flash = await fetchFlashLazerPrices();
+    const byMint = (S.flashLazerIds && S.flashLazerIds.byMint) || {};
+    const feeds = {}, prices = {};
+    for (const c of allDescriptors()) {
+      if (c.symbol in feeds) continue;
+      const reg = c.mint ? byMint[c.mint] : null;          // exact mint match first
+      const apiSym = reg ? reg.symbol : (flash[c.symbol] ? c.symbol : null);
+      if (!apiSym || !flash[apiSym]) continue;
+      feeds[c.symbol] = { id: reg && reg.lazerId != null ? reg.lazerId : null, pythSymbol: "Lazer/" + apiSym, source: "flash-api" };
+      prices[c.symbol] = flash[apiSym];
+    }
+    if (Object.keys(prices).length) { S.pyth = { feeds, prices, source: "flash-api" }; return; }
+    throw new Error("no overlapping symbols");
+  } catch (e) { S.cycleErrors.push("flashapi prices: " + e.message); }
+}
+
+let lastCustodyRefresh = 0, busy = false, lastGovCheck = 0;
+const GOV_CHECK_MS = Number(process.env.GOV_CHECK_MS || 120000); // governance rarely changes; 5 RPCs
+async function cycle(reason) {
+  if (busy) return;
+  busy = true;
+  const t0 = Date.now();
+  S.cycleErrors = [];
+  try {
+    if (Date.now() - lastCustodyRefresh > CUSTODY_REFRESH_MS) {
+      await refreshCustodies(); lastCustodyRefresh = Date.now();
+      const nowVaults = tracked().map((c) => c.vault).sort().join(",");
+      if (nowVaults !== wsVaults) connectWs(); // new listing → resubscribe
+    }
+    const mk = await fetchMarks(er, main, allDescriptors());
+    S.marks = mk.marks; S.markTimes = mk.markTimes; S.lazerIds = mk.lazerIds || {}; S.lazerMarks = mk.lazerMarks || {};
+    try { S.markets = await scanMarkets(er, S.custodies, S.marks); } catch (e) { S.cycleErrors.push("markets: " + e.message); }
+    const cutoff = now() - BACKFILL_HOURS * 3600;
+    let freshCount = 0;
+    for (const cust of tracked()) {
+      try { freshCount += await pollVault(cust, cutoff); }
+      catch (e) { S.cycleErrors.push(`${cust.pool}/${cust.symbol}: ${e.message}`); }
+    }
+    try { const p = await runSweep(cutoff); if (p) connectWs(); } catch (e) { S.cycleErrors.push("sweep: " + e.message); }
+    S.balances = await fetchVaultBalances(main, tracked());
+    checkConservation();
+    await refreshIndependentPrices();
+    if (Date.now() - lastGovCheck > GOV_CHECK_MS) { await checkGovernance(); lastGovCheck = Date.now(); }
+    S.events.sort((a, b) => a.blockTime - b.blockTime);
+    pruneMemory();
+    const ev = evaluate(now(), S.events, S.failures, allDescriptors(), S.balances, S.marks, S.markTimes, S.lazerMarks || {}, S.pyth, S.limits, S.authority);
+    processAlertTransitions(ev);
+    S.lastEval = ev;
+    saveState();
+    S.lastCycle = now(); S.cycleSeconds = +((Date.now() - t0) / 1000).toFixed(1); S.cycles++;
+    heartbeat(); // dead-man ping — external monitor alerts if the sentinel goes silent
+    maybeSendDigest(); // daily status broadcast to the channel
+    maybeSendWeekly(); // weekly deep-dive broadcast
+    if (freshCount) log(`cycle #${S.cycles}${reason ? ` (${reason})` : ""}: +${freshCount} events, ${S.cycleSeconds}s, global out1h $${ev.global.out1hUsd} [${ev.global.status}]`);
+    broadcast();
+  } catch (e) {
+    S.cycleErrors.push("cycle: " + (e.message || e));
+    log("CYCLE ERROR:", e.message || e);
+  } finally {
+    busy = false;
+  }
+}
+
+// ---------------- snapshot / api ----------------
+function hourlyBuckets() {
+  // Buckets are hour-aligned for readable axis labels, but ONLY events inside the same
+  // rolling 24h window the KPIs use are counted — so Σ buckets always equals the 24h totals.
+  const t = now(), start = t - 24 * 3600;
+  const buckets = [];
+  const h0 = Math.floor(start / 3600) * 3600;
+  for (let h = h0; h <= t; h += 3600) buckets.push({ hourStart: h, inUsd: 0, outUsd: 0, inN: 0, outN: 0 });
+  for (const e of S.events) {
+    if (e.blockTime < start || e.blockTime > t) continue;
+    if (S.authority && e.wallet === S.authority) continue; // internal vault→vault reshuffles excluded
+    const idx = Math.floor((e.blockTime - h0) / 3600);
+    const b = buckets[idx]; if (!b) continue;
+    if (e.direction === "out") { b.outUsd += e.usd || 0; b.outN++; } else { b.inUsd += e.usd || 0; b.inN++; }
+  }
+  return buckets.map((b) => ({ ...b, inUsd: Math.round(b.inUsd * 100) / 100, outUsd: Math.round(b.outUsd * 100) / 100 }));
+}
+function conservationRows() {
+  return tracked().map((c) => {
+    const cv = S.conservation[c.vault] || null;
+    const bal = S.balances[c.vault];
+    return cv && {
+      key: c.pool + "/" + c.symbol, vault: c.vault,
+      baseRaw: cv.baseRaw, baseTime: cv.baseTime, sumDeltas: cv.sumDeltas,
+      balanceRaw: bal == null ? null : bal.toString(), residual: cv.residual, status: cv.status, rebases: cv.rebases,
+    };
+  }).filter(Boolean);
+}
+function snapshot() {
+  const consRows = conservationRows();
+  return {
+    meta: {
+      name: "FLASH FLOW SENTINEL", program: PROG, cluster: "mainnet", erRpc: redact(ER_URL), mainRpc: redact(MAIN_URL),
+      erSlot: S.erSlot, custodies: S.custodies.length, realVaults: realC().length, trackedVaults: tracked().length, markets: S.markets.length, pools: S.pools,
+      sweep: { authority: S.authority, watched: Object.keys(S.sweepBal).length, promoted: Object.keys(S.dynamic).length, namedVaults: S.named.map((n) => `${n.pool}/${n.symbol}`) },
+      startedAt: S.startedAt, lastCycle: S.lastCycle, cycleSeconds: S.cycleSeconds, pollMs: POLL_MS, cycles: S.cycles, wsPush: wsUp,
+      backfillHours: BACKFILL_HOURS, retentionHours: RETENTION_HOURS, eventsRetained: S.events.length,
+      cycleErrors: S.cycleErrors.slice(0, 8),
+      oracleSource: S.pyth.source || "flash-api", lazer: { tokenPresent: !!S.lazer.token, ok: S.lazer.ok, reason: S.lazer.reason },
+      channels: channelsConfigured(),
+      squadsMofN: process.env.SQUADS_MOFN || "3-of-7", // Squads governance threshold (operator-set, verifiable on the Squads app)
+      limitsWritable: HOST === "127.0.0.1" && !process.env.LIMITS_WRITE_TOKEN, // public view is read-only
+      dataNote: "All values decoded from real on-chain state: base-chain SPL transfers (exact u64 vault deltas from pre/post token balances, confirmed commitment), ER custody/oracle accounts via the program's own on-chain IDL, Pyth Lazer cross-check. Tracked vaults = every custody vault + TradeVault + RebateVault + FAF TokenVault, plus a balance sweep of EVERY token account owned by the program's vault authority — any untracked account that moves is auto-promoted to full per-transaction tracking. Capture is push-triggered by WebSocket accountSubscribe plus a baseline poll. USD at the on-chain oracle mark observed at ingest. No synthetic data.",
+      guardNote: "Guards bound the drain class seen across perp DEXes: a manipulated or stale price feed generating fake profits that exit the vaults within minutes.",
+    },
+    limits: S.limits,
+    evaluation: S.lastEval || null,
+    markets: S.markets,
+    hourly: hourlyBuckets(),
+    hourlySides: hourlyBucketsBySide(now(), S.events, S.authority),
+    conservation: { rows: consRows, allExact: consRows.every((r) => r.status === "exact"), sinceOldestBase: consRows.length ? Math.min(...consRows.map((r) => r.baseTime)) : null },
+    governance: S.governance ? { ...S.governance, changes: S.govChanges.slice(-40).reverse() } : null,
+    alerts: { active: S.alertsActive, log: S.alertsLog.slice(-100).reverse() },
+    events: S.events.slice(-250).reverse().map((e) => ({ ...e, kind: classify(e.ix || [], e.direction), internal: !!(S.authority && e.wallet === S.authority) })),
+    failures1h: S.failures.filter((f) => f.blockTime >= now() - 3600).length,
+    pythFeeds: Object.keys(S.pyth.feeds).length,
+  };
+}
+function broadcast() {
+  const msg = `event: cycle\ndata: ${JSON.stringify({ at: now(), cycles: S.cycles })}\n\n`;
+  for (const res of S.sse) { try { res.write(msg); } catch (e) { S.sse.delete(res); } }
+}
+
+const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon" };
+const server = http.createServer((req, res) => {
+  const u = new URL(req.url, "http://x");
+  const send = (code, body, type = "application/json") => { res.writeHead(code, { "Content-Type": type, "Access-Control-Allow-Origin": "*" }); res.end(body); };
+  try {
+    if (u.pathname === "/api/state") return send(200, JSON.stringify(snapshot()));
+    if (u.pathname === "/api/events") {
+      const hours = Math.min(Number(u.searchParams.get("hours") || 24), RETENTION_HOURS);
+      const limit = Math.min(Number(u.searchParams.get("limit") || 2000), 10000);
+      const cutoff = now() - hours * 3600;
+      return send(200, JSON.stringify(S.events.filter((e) => e.blockTime >= cutoff).slice(-limit).reverse()));
+    }
+    // write-gate: mutations (limits, ack). Local loopback daemon = trusted (operator's machine).
+    // Hosted (0.0.0.0): require LIMITS_WRITE_TOKEN via header; without it, writes are disabled so
+    // a public visitor can never change your caps. Reads always stay open.
+    const WRITE_TOKEN = process.env.LIMITS_WRITE_TOKEN;
+    const isWrite = (u.pathname === "/api/ack" || u.pathname === "/api/limits") && req.method === "POST";
+    if (isWrite) {
+      if (WRITE_TOKEN) {
+        if (req.headers["x-limits-token"] !== WRITE_TOKEN) return send(403, JSON.stringify({ ok: false, error: "invalid x-limits-token" }));
+      } else if (HOST !== "127.0.0.1") {
+        return send(405, JSON.stringify({ ok: false, error: "writes disabled on the public deployment — set LIMITS_WRITE_TOKEN (and send it as x-limits-token) or edit limits from the local daemon" }));
+      }
+    }
+    // acknowledge (clear) a latched governance alert after a human has reviewed it
+    if (u.pathname === "/api/ack" && req.method === "POST") {
+      const rule = u.searchParams.get("rule");
+      if (rule === "all") { for (const k of Object.keys(S.alertsActive)) if (k.startsWith("gov:")) delete S.alertsActive[k]; }
+      else if (rule && S.alertsActive[rule]) delete S.alertsActive[rule];
+      else return send(404, JSON.stringify({ ok: false, error: "no such active alert" }));
+      saveState();
+      return send(200, JSON.stringify({ ok: true, active: Object.keys(S.alertsActive) }));
+    }
+    if (u.pathname === "/api/limits" && req.method === "GET") return send(200, JSON.stringify(S.limits));
+    if (u.pathname === "/api/limits" && req.method === "POST") {
+      let body = "";
+      req.on("data", (c) => { body += c; if (body.length > 65536) req.destroy(); });
+      req.on("end", () => {
+        try {
+          const j = JSON.parse(body);
+          const num = (v) => (v === null || (typeof v === "number" && Number.isFinite(v) && v >= 0) ? v : undefined);
+          const patch = {};
+          if (num(j.globalOutflowUsdPerHour) !== undefined) patch.globalOutflowUsdPerHour = j.globalOutflowUsdPerHour;
+          if (typeof j.warnFraction === "number" && j.warnFraction > 0 && j.warnFraction <= 1) patch.warnFraction = j.warnFraction;
+          if (num(j.defaultTokenOutflowUsdPerHour) !== undefined) patch.defaultTokenOutflowUsdPerHour = j.defaultTokenOutflowUsdPerHour;
+          if (j.perTokenOutflowUsdPerHour && typeof j.perTokenOutflowUsdPerHour === "object") { patch.perTokenOutflowUsdPerHour = {}; for (const [k, v] of Object.entries(j.perTokenOutflowUsdPerHour)) if (num(v) !== undefined) patch.perTokenOutflowUsdPerHour[k] = v; }
+          if (num(j.perWalletOutflowUsdPerHour) !== undefined) patch.perWalletOutflowUsdPerHour = j.perWalletOutflowUsdPerHour;
+          if (num(j.vaultDrawdownPctPerHour) !== undefined) patch.vaultDrawdownPctPerHour = j.vaultDrawdownPctPerHour;
+          if (num(j.oracleDeviationPct) !== undefined) patch.oracleDeviationPct = j.oracleDeviationPct;
+          if (j.webhookUrl === null || (typeof j.webhookUrl === "string" && /^https?:\/\//.test(j.webhookUrl))) patch.webhookUrl = j.webhookUrl;
+          S.limits = { ...S.limits, ...patch };
+          saveLimits();
+          if (S.lastEval) { const ev = evaluate(now(), S.events, S.failures, allDescriptors(), S.balances, S.marks, S.markTimes, S.lazerMarks || {}, S.pyth, S.limits, S.authority); processAlertTransitions(ev); S.lastEval = ev; }
+          send(200, JSON.stringify({ ok: true, limits: S.limits }));
+        } catch (e) { send(400, JSON.stringify({ ok: false, error: e.message })); }
+      });
+      return;
+    }
+    if (u.pathname === "/events") {
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "Access-Control-Allow-Origin": "*" });
+      res.write("retry: 3000\n\n");
+      S.sse.add(res);
+      req.on("close", () => S.sse.delete(res));
+      return;
+    }
+    // static (root files, allowlisted — same files Vercel serves)
+    const STATIC = new Set(["index.html", "app.js", "styles.css", "flash-trade-v2.png", "favicon.png"]);
+    const name = u.pathname === "/" ? "index.html" : u.pathname.slice(1);
+    if (STATIC.has(name)) {
+      // HTML must always revalidate (so new ?v= asset tags are picked up); assets are versioned → cacheable
+      const cache = name === "index.html" ? "no-cache, must-revalidate" : "public, max-age=300";
+      res.writeHead(200, { "Content-Type": MIME[path.extname(name)] || "application/octet-stream", "Access-Control-Allow-Origin": "*", "Cache-Control": cache });
+      return res.end(fs.readFileSync(path.join(__dirname, name)));
+    }
+    send(404, JSON.stringify({ error: "not found" }));
+  } catch (e) { send(500, JSON.stringify({ error: e.message })); }
+});
+
+// ---------------- startup ----------------
+(async () => {
+  if (!fs.existsSync(DATA)) fs.mkdirSync(DATA, { recursive: true });
+  loadLimits(); loadState(); loadEvents();
+  // one-time migration: the drawdown alarm default was raised 5→20/h (5%/h false-warned on normal
+  // small-vault trading, well under the $100k/h cap). Bump any persisted value still at the old 5.
+  if (S.limits.vaultDrawdownPctPerHour === 5 && DEFAULT_LIMITS.vaultDrawdownPctPerHour !== 5) {
+    S.limits.vaultDrawdownPctPerHour = DEFAULT_LIMITS.vaultDrawdownPctPerHour; saveLimits();
+    log(`migrated vaultDrawdownPctPerHour 5 → ${S.limits.vaultDrawdownPctPerHour}/h`);
+  }
+  log(`FLASH FLOW SENTINEL — program ${PROG}`);
+  log(`ER: ${redact(ER_URL)} | base: ${redact(MAIN_URL)} | poll ${POLL_MS / 1000}s | backfill ${BACKFILL_HOURS}h`);
+
+  // Listen IMMEDIATELY so a hosting platform's health check passes and the page loads (showing
+  // "ARMING GUARDS…") during the initial backfill, instead of the container looking dead for ~60s.
+  server.listen(PORT, HOST, () => log(`dashboard → http://${HOST}:${PORT}`));
+
+  await refreshCustodies(); lastCustodyRefresh = Date.now();
+  log(`custodies: ${S.custodies.length} total (${realC().length} real vaults) across ${S.pools} pools (ER slot ${S.erSlot})`);
+
+  // vault authority (from the first custody vault's token-account owner) + named vaults + sweep baseline
+  try {
+    const rc0 = realC()[0];
+    const r = await main("getMultipleAccounts", [[rc0.vault], { encoding: "jsonParsed" }]);
+    S.authority = r.result.value[0].data.parsed.info.owner;
+  } catch (e) { log("authority discovery failed: " + (e.message || e)); }
+  const namedRaw = await scanNamedVaults(er, S.custodies);
+  const sweep0 = S.authority ? await sweepAuthority(main, S.authority) : {};
+  S.named = namedRaw.map((v) => describeVault(v, S.custodies, sweep0[v.ta] || null));
+  // re-describe persisted dynamic promotions against the fresh custody list
+  for (const [ta, d] of Object.entries(S.dynamic)) S.dynamic[ta] = describeVault({ pda: d.custody, pool: d.pool, ta, mint: d.mint, kind: d.kind }, S.custodies, sweep0[ta] || null);
+  for (const [ta, info] of Object.entries(sweep0)) if (S.sweepBal[ta] == null) S.sweepBal[ta] = info.amountRaw;
+  log(`vault authority ${S.authority ? S.authority.slice(0, 8) + "…" : "?"} — named vaults: ${S.named.map((n) => `${n.pool}/${n.symbol}`).join(", ") || "none"} · sweep watching ${Object.keys(S.sweepBal).length} token accounts (${Object.keys(S.dynamic).length} promoted)`);
+
+  // official Lazer feed ids from Flash API /tokens (symbol → lazerId)
+  try { S.flashLazerIds = await fetchFlashLazerIds(); } catch (e) { log("flashapi /tokens: " + (e.message || e)); }
+  log(`price source: ${S.lazer.token ? "PYTH LAZER direct (token present)" : "Flash API Lazer feed (flashapi.trade/prices)"} · ${Object.keys((S.flashLazerIds && S.flashLazerIds.byMint) || {}).length} tokens in registry`);
+
+  { const mk = await fetchMarks(er, main, allDescriptors()); S.marks = mk.marks; S.markTimes = mk.markTimes; S.lazerIds = mk.lazerIds || {}; S.lazerMarks = mk.lazerMarks || {}; }
+  log(`oracle marks: ${Object.keys(S.marks).length}/${allDescriptors().length}`);
+  try { S.markets = await scanMarkets(er, S.custodies, S.marks); log(`markets: ${S.markets.length} market-sides live`); } catch (e) { log("markets: " + e.message); }
+
+  // EARLY PAINT: evaluate the events loaded from disk (persistent volume) + live balances BEFORE the
+  // heavy per-vault backfill, so a restart serves last-good real data within seconds instead of empties.
+  try {
+    S.balances = await fetchVaultBalances(main, tracked());
+    S.events.sort((a, b) => a.blockTime - b.blockTime);
+    await refreshIndependentPrices();
+    S.lastEval = evaluate(now(), S.events, S.failures, allDescriptors(), S.balances, S.marks, S.markTimes, S.lazerMarks || {}, S.pyth, S.limits, S.authority);
+    S.lastCycle = now(); S.cycles = 1;
+    log(`early paint from ${S.events.length} persisted events: 24h out $${S.lastEval.global.out24hUsd} in $${S.lastEval.global.in24hUsd}`);
+  } catch (e) { log("early paint skipped: " + e.message); }
+
+  // initial backfill (custody vaults + TradeVault/RebateVault/TokenVault + promoted accounts)
+  const cutoff = now() - BACKFILL_HOURS * 3600;
+  log(`backfilling ${BACKFILL_HOURS}h of real transfers for ${tracked().length} vaults…`);
+  let n = 0;
+  for (const cust of tracked()) {
+    try { const f = await pollVault(cust, cutoff); n += f; if (f) log(`  ${cust.pool}/${cust.symbol}: +${f} events`); }
+    catch (e) { log(`  ${cust.pool}/${cust.symbol}: ${e.message}`); }
+  }
+  log(`backfill complete: ${n} new events (${S.events.length} total retained)`);
+
+  S.balances = await fetchVaultBalances(main, tracked());
+  checkConservation(); // establishes per-vault baselines → conservation proof runs from here
+  await refreshIndependentPrices();
+  await checkGovernance(); lastGovCheck = Date.now(); // baseline the authority surface at startup
+  { const g = S.governance, ch = channelsConfigured();
+    log(`governance: upgrade authority ${g && g.upgradeAuthority ? g.upgradeAuthority.slice(0, 6) + "…" : "?"}${g && g.upgradeControl ? " (control: " + g.upgradeControl.model + ")" : ""} · Squads ${process.env.SQUADS_MOFN || "3-of-7"} · alert channels: ${Object.entries(ch).filter(([, v]) => v).map(([k]) => k).join(", ") || "none (set TELEGRAM_*/SLACK_WEBHOOK_URL/HEARTBEAT_URL)"}`); }
+  S.events.sort((a, b) => a.blockTime - b.blockTime);
+  const ev = evaluate(now(), S.events, S.failures, allDescriptors(), S.balances, S.marks, S.markTimes, S.lazerMarks || {}, S.pyth, S.limits, S.authority);
+  processAlertTransitions(ev);
+  S.lastEval = ev;
+  S.lastCycle = now(); S.cycles = 1;
+  saveState();
+  log(`global outflow 1h: $${ev.global.out1hUsd} / $${ev.global.limitUsdPerHour} [${ev.global.status}] | 24h out $${ev.global.out24hUsd} in $${ev.global.in24hUsd}`);
+
+  // self-contained dead-man: if the daemon was down longer than a normal restart, tell the operator
+  // (privately) how long it was silent — so an outage never passes unnoticed even without an external monitor.
+  const downGap = S.lastSavedAt ? now() - S.lastSavedAt : 0;
+  if (downGap > 240) { // >4 min gap = a real outage, not a routine redeploy
+    const mins = Math.floor(downGap / 60);
+    sendOperator(`⚠️ FLASH FLOW SENTINEL restarted after ${mins >= 60 ? Math.floor(mins / 60) + "h " + (mins % 60) + "m" : mins + "m"} of downtime — now back online and monitoring.\nGuards: ${ev.global.status === "ok" ? "green" : ev.global.status}. Dashboard: flash-flow-sentinel.vercel.app`);
+    log(`recovery notice sent to operator (was down ${mins}m)`);
+  }
+
+  connectWs();
+  setInterval(() => cycle("poll"), POLL_MS);
+})().catch((e) => { console.error("FATAL:", e); process.exit(1); });
+
+process.on("SIGINT", () => { try { saveState(); } catch (e) {} process.exit(0); });
+process.on("SIGTERM", () => { try { saveState(); } catch (e) {} process.exit(0); });

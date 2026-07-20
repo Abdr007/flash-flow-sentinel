@@ -1,0 +1,16 @@
+api
+lib
+data
+node_modules
+*.log
+*.cjs
+sentinel.js
+app.js
+index.html
+styles.css
+Dockerfile
+railway.json
+.dockerignore
+.gitignore
+.env
+.env.*

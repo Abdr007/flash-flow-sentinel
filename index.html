@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Flash V2 · Flow Sentinel — Vault Outflow Limits (Mainnet)</title>
+  <meta name="description" content="Flash V2 mainnet — every custody-vault inflow and outflow decoded live from the base chain, with hourly outflow limits, wallet concentration, drawdown velocity and a Pyth Lazer oracle cross-check. Flows, balances and conservation are on-chain; no synthetic data." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="icon" type="image/png" href="./flash-trade-v2.png" />
+  <link rel="stylesheet" href="./styles.css?v=20260720b" />
+</head>
+<body>
+  <div class="scanlines" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <img class="logo-lockup" src="./flash-trade-v2.png" alt="Flash Trade V2" />
+      <span class="brand-divider"></span>
+      <div class="brand-text">
+        <span class="brand-title">FLOW&nbsp;SENTINEL <span class="badge-net">MAINNET</span></span>
+        <span class="brand-sub" id="brandSub">vault inflow / outflow limits · every transfer decoded live from the base chain</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <a class="chip chip-prog" id="chipProgram" href="https://solscan.io/account/FLASH6Lo6h3iasJKWDs2F8TkW2UKf3s15C8PMGuVfgBn" target="_blank" rel="noopener" title="Flash V2 perps program (mainnet)">FLASH6…</a>
+      <span class="chip" id="chipWs" title="WebSocket accountSubscribe on every custody vault — a vault movement triggers an immediate decode cycle">PUSH —</span>
+      <span class="chip" id="chipCycle" title="decode cycle cadence">cycle —</span>
+      <span class="status" id="liveStatus"><span class="dot"></span><span id="liveText">CONNECTING</span></span>
+      <span class="asof" id="asOf">—</span>
+    </div>
+  </header>
+
+  <main class="wrap">
+
+    <!-- ===== HERO VERDICT — are all flow guards green right now? ===== -->
+    <section class="verdict" id="verdict">
+      <div class="verdict-main">
+        <span class="verdict-flag" id="verdictFlag">ARMING GUARDS…</span>
+        <span class="verdict-sub" id="verdictSub">reading live vault flows from the base chain…</span>
+      </div>
+      <div class="verdict-checks" id="verdictChecks"></div>
+    </section>
+
+    <!-- KPI strip -->
+    <section class="kpi-grid" id="kpiGrid"></section>
+
+    <!-- ===== GLOBAL FLOW CHART + THE LIMIT ===== -->
+    <section class="card focus">
+      <div class="card-head">
+        <h2>Global Flow — Inflow ▲ / Outflow ▼ Across All Vaults (rolling 24h, hourly, UTC)</h2>
+        <div class="card-actions">
+          <span class="chart-legend"><span><i style="background:var(--pos)"></i>Inflow ▲</span><span><i style="background:var(--neg)"></i>Outflow ▼</span></span>
+          <span class="card-tag" id="chartTag">—</span>
+        </div>
+      </div>
+      <p class="note">Every bar is the USD sum of <strong>real SPL transfers</strong> in/out of every tracked program vault — all custody vaults + TradeVault + RebateVault + staking + swept authority accounts — decoded transaction-by-transaction from pre/post token balances (exact u64) and valued at the <strong>on-chain oracle mark</strong> observed at capture. Vault→vault <strong>internal settlements are excluded</strong> (they are not user flows). The meter below is the <strong>outflow velocity cap</strong>: total outflow across <em>all wallets</em> per rolling hour vs the configured limit.</p>
+      <div id="chartWrap"></div>
+      <div class="limit-hero" id="limitHero"></div>
+    </section>
+
+    <!-- ===== TRADE SIDE — own card, own graph ===== -->
+    <section class="card focus">
+      <div class="card-head">
+        <h2>Trade Side Flow — trader collateral, Inflow ▲ / Outflow ▼ (rolling 24h, hourly, UTC)</h2>
+        <div class="card-actions">
+          <span class="chart-legend"><span><i style="background:var(--pos)"></i>Inflow ▲</span><span><i style="background:var(--neg)"></i>Outflow ▼</span></span>
+          <span class="card-tag" id="tradeTag">—</span>
+        </div>
+      </div>
+      <p class="note"><strong>Trade side</strong> = trader-collateral flows, dominated by <strong>TradeVault deposits and withdrawals</strong>, plus any custody-pool trade legs that are user-facing (not internal settlements). Each transfer is attributed from its transaction's <strong>own instruction names</strong>; vault→vault internal settlements are excluded.</p>
+      <div id="chartTrade"></div>
+      <div class="recon-summary" id="tradeSummary" style="margin-top:14px"></div>
+      <h3 class="sub-h">Trade side — token breakdown</h3>
+      <div class="table-wrap"><table class="grid" id="sideTradeTable"></table></div>
+    </section>
+
+    <!-- ===== LP SIDE — own card, own graph ===== -->
+    <section class="card focus">
+      <div class="card-head">
+        <h2>LP Side Flow — liquidity provision, Inflow ▲ / Outflow ▼ (rolling 24h, hourly, UTC)</h2>
+        <div class="card-actions">
+          <span class="chart-legend"><span><i style="background:var(--pos)"></i>Inflow ▲</span><span><i style="background:var(--neg)"></i>Outflow ▼</span></span>
+          <span class="card-tag" id="lpTag">—</span>
+        </div>
+      </div>
+      <p class="note"><strong>LP side</strong> = liquidity provision only: add/remove liquidity (incl. compounding sFLP, FLP migration), per pool. Internal vault→vault settlements excluded.</p>
+      <div id="chartLp"></div>
+      <div class="recon-summary" id="lpSummary" style="margin-top:14px"></div>
+      <h3 class="sub-h">LP side — token breakdown</h3>
+      <div class="table-wrap"><table class="grid" id="sideLpTable"></table></div>
+      <div class="recon-idline" id="sideOther" style="margin-top:14px"></div>
+    </section>
+
+    <!-- ===== ALL MARKETS ===== -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Every Market Traded On Flash — live <code>collective_position</code> state</h2>
+        <div class="card-actions"><input id="mktFilter" class="filter" placeholder="filter market / side / pool…" /><span class="card-tag" id="mktTag">—</span></div>
+      </div>
+      <p class="note">All market-sides decoded from the ER every cycle — open interest, collateral liability, open positions, average entry and the live on-chain mark (with synthetic targets like FX / metals / xStocks resolved through their virtual custodies). These values are the program's own <code>Market.collective_position</code> aggregate, decoded with the program's on-chain IDL (this panel displays that aggregate; it does not re-derive it from individual baskets).</p>
+      <div class="table-wrap scrollbox"><table class="grid" id="mktTable"></table></div>
+    </section>
+
+    <!-- ===== PER-TOKEN TABLE ===== -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Per-Token Flows &amp; Hourly Limits — every custody vault</h2>
+        <div class="card-actions"><input id="tokFilter" class="filter" placeholder="filter token / pool / mint…" /><span class="card-tag" id="tokTag">—</span></div>
+      </div>
+      <p class="note">Active vaults (any flow in 24h) are listed first; quiet vaults are dimmed below. <strong>Drawdown 1h</strong> = share of the vault drained in the last rolling hour (balance one hour ago is reconstructed from the raw u64 deltas observed in that window). <strong>Cap util 1h</strong> = this vault's outflow this hour as a share of its per-token cap if one is set, otherwise of the global outflow cap. A <span class="noflow">·</span> means no flow in that window (hover for detail). Failed txs are also counted, as a supplementary signal.</p>
+      <div class="table-wrap scrollbox"><table class="grid" id="tokTable"></table></div>
+    </section>
+
+    <!-- ===== GOVERNANCE & AUTHORITY WATCH ===== -->
+    <section class="card focus">
+      <div class="card-head">
+        <h2>Governance &amp; Authority Watch — the start of the kill-chain</h2>
+        <span class="card-tag" id="govTag">—</span>
+      </div>
+      <p class="note">A drain often begins with a <strong>permission change</strong> — an upgrade-authority swap, an unexpected redeploy, or a protocol permission flip — before any money moves. Every field below is read live on-chain: the program upgrade authority + last-deploy slot from the BPF loader, and <strong>how upgrades are actually executed</strong> — this program's upgrades run through the <strong>Squads multisig</strong> (verified from the latest on-chain upgrade tx), and the global <code>Perpetuals</code> permission flags. A baseline is taken on first read; <strong>any change raises a critical alert</strong>.</p>
+      <div class="recon-summary" id="govSummary"></div>
+      <h3 class="sub-h">Global protocol permissions <span id="govPermNote" class="dim"></span></h3>
+      <div id="govPerms" class="recon-checks"></div>
+      <span id="govMsNote" hidden></span><span id="govMsTable" hidden></span>
+      <div class="recon-idline" id="govChannels" style="margin-top:12px"></div>
+    </section>
+
+    <!-- ===== WALLETS + ORACLE ===== -->
+    <div class="split">
+      <section class="card">
+        <div class="card-head"><h2>Top Wallets By Outflow — 1h</h2><span class="card-tag" id="walTag">—</span></div>
+        <p class="note">Drains typically loop through a handful of controlled wallets. Single-wallet concentration against the per-wallet hourly cap.</p>
+        <div class="table-wrap"><table class="grid" id="walTable"></table></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Oracle Guard — FLASH6 Mark vs Pyth</h2><span class="card-tag" id="oraTag">—</span></div>
+        <p class="note">A manipulated or stale price feed is the classic vault-drain vector. Every custody's on-chain <code>CustomOracle</code> mark (with its on-chain <code>publish_time</code>) is cross-checked against <strong>Pyth Lazer</strong> — directly (token-gated, via <code>LAZER_ACCESS_TOKEN</code>) or via the <strong>Flash V2 API Lazer feed</strong> (<code>flashapi.trade/prices</code>, official Lazer ids from <code>/tokens</code>). This compares the value written on-chain against a live read of the Lazer feed, so a mark forged <em>at the on-chain oracle</em> (rather than at Lazer itself) diverges immediately. Paused/closed markets (<code>marketSession</code> + on-chain <code>publish_time</code>) are shown as MARKET IDLE and never alarm. The active source is on the tag.</p>
+        <div class="table-wrap scrollbox"><table class="grid" id="oraTable"></table></div>
+      </section>
+    </div>
+
+    <!-- ===== LIMITS CONFIG ===== -->
+    <section class="card focus">
+      <div class="card-head"><h2 id="limTitle">Active Guard Thresholds</h2><span class="card-tag" id="limTag">live · protecting the vaults</span></div>
+      <p class="note" id="limNote">These are the exact thresholds the sentinel is enforcing right now — cross any one and it alerts instantly. <strong>Detection layer: it pages the operator; halting an outflow on-chain needs a program-level circuit breaker.</strong></p>
+      <div class="limits-grid" id="limitsGrid"></div>
+      <div class="limits-actions">
+        <button class="btn-apply" id="btnApply">APPLY LIMITS</button>
+        <span id="limitsMsg"></span>
+      </div>
+    </section>
+
+    <!-- ===== LIVE FEED ===== -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Live Transfer Feed — every row is a real confirmed mainnet transaction</h2>
+        <div class="card-actions"><input id="feedFilter" class="filter" placeholder="filter token / wallet / kind / sig…" /><span class="card-tag" id="feedTag">—</span></div>
+      </div>
+      <div class="table-wrap scrollbox"><table class="grid" id="feedTable"></table></div>
+    </section>
+
+    <!-- ===== ALERT LOG ===== -->
+    <section class="card">
+      <div class="card-head"><h2>Alert Log — guard transitions</h2><span class="card-tag" id="alertTag">—</span></div>
+      <div class="table-wrap scrollbox"><table class="grid" id="alertTable"></table></div>
+    </section>
+
+    <!-- ===== CONSERVATION PROOF ===== -->
+    <section class="card focus">
+      <div class="card-head"><h2>Flow Conservation Proof — <code>baseline + Σ observed deltas == live vault balance</code> (raw u64)</h2><span class="card-tag" id="proofTag">—</span></div>
+      <p class="note">The dashboard <strong>proves it has not missed a transfer</strong>: for every vault, the balance at baseline plus the sum of every observed transaction delta must equal the live SPL balance — raw u64, <strong>zero tolerance</strong>, re-checked every cycle. A transfer landing mid-cycle shows briefly as <em>syncing</em> and must reconcile exactly on the next cycle.</p>
+      <div class="table-wrap scrollbox"><table class="grid" id="proofTable"></table></div>
+    </section>
+
+    <footer class="foot">
+      <span id="footSource">—</span>
+      <span class="dim" id="footWhy">—</span>
+      <span class="dim">Read-only monitor · flows/balances/conservation on-chain · price cross-check via Pyth Lazer (Flash API) · no synthetic data</span>
+    </footer>
+  </main>
+
+  <div id="tooltip"></div>
+  <script src="./app.js?v=20260720b" defer></script>
+</body>
+</html>
