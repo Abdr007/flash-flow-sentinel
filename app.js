@@ -6,7 +6,7 @@
    ============================================================================ */
 
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const short = (a, n = 4) => (a ? a.slice(0, n) + "…" + a.slice(-n) : "—");
 const scanTx = (s) => `https://solscan.io/tx/${s}`;
 const scanAcct = (a) => `https://solscan.io/account/${a}`;
@@ -63,18 +63,38 @@ const tip = $("tooltip");
 const showTip = (html, x, y) => { tip.innerHTML = html; tip.style.display = "block"; const r = tip.getBoundingClientRect(); tip.style.left = Math.min(x + 14, innerWidth - r.width - 10) + "px"; tip.style.top = Math.min(y + 14, innerHeight - r.height - 10) + "px"; };
 const hideTip = () => (tip.style.display = "none");
 
+/* ---------- liveness / freshness (never show green while blind) ---------- */
+let connected = false, lastFetchMs = Date.now();
+// true monitor age: server's own clock at snapshot (advances even if the cycle loop wedges, because the
+// HTTP server is independent) + wall-clock delta since we fetched → robust to the viewer's clock being off.
+function stalenessAge(m) {
+  if (!m || m.lastCycle == null) return null;
+  const base = m.serverNow != null ? m.serverNow : Math.floor(Date.now() / 1000);
+  return base + (Date.now() - lastFetchMs) / 1000 - m.lastCycle;
+}
+function freshnessState(m) {
+  if (!connected) return "offline";           // last fetch failed → cannot confirm anything
+  if (m && m.backfilling) return "building";   // still loading the 24h window → not yet authoritative
+  const age = stalenessAge(m), cutoff = (m && m.staleCutoffSec) || 90;
+  if (age == null || age > cutoff) return "stale"; // cycle loop wedged/slow → last reading may be out of date
+  return "live";
+}
+
 /* ---------- header ---------- */
 function renderHeader(S) {
   const m = S.meta;
   $("asOf").textContent = m.lastCycle ? `as of ${utcHMS(m.lastCycle)} UTC · ${ago(m.lastCycle)} ago · cycle #${m.cycles}${m.cycleSeconds != null ? ` in ${m.cycleSeconds}s` : ""}` : "—";
   $("chipWs").textContent = m.wsPush ? "PUSH ⚡ WS LIVE" : m.cloud ? "CLOUD · 10s refresh" : "PUSH — poll only";
   $("chipWs").style.color = m.wsPush || m.cloud ? "var(--teal)" : "var(--amber)";
+  $("chipWs").title = m.wsPush ? "WebSocket accountSubscribe on every vault — sub-second push capture" : m.cloud ? "serverless deployment: 10s refresh (no WebSocket push)" : "push unavailable this cycle — the 12s baseline poll is the safety net, no flow is missed";
   $("chipCycle").textContent = `poll ${Math.round(m.pollMs / 1000)}s · ${m.eventsRetained} events`;
   $("brandSub").textContent = `${m.custodies} custodies · ${m.trackedVaults || m.realVaults} vaults tracked${m.sweep && m.sweep.watched ? ` · ${m.sweep.watched} authority accounts swept` : ""} · ${m.markets} market-sides · ${m.pools} pools · ER slot ${m.erSlot ? m.erSlot.toLocaleString("en-US") : "—"}`;
-  const st = $("liveStatus");
-  st.classList.remove("offline"); $("liveText").textContent = "LIVE";
+  const st = $("liveStatus"), fs = freshnessState(m);
+  $("liveText").textContent = { live: "LIVE", building: "ARMING", stale: "STALE", offline: "RECONNECTING" }[fs];
+  st.classList.toggle("offline", fs === "stale" || fs === "offline"); // amber/red pulse for not-live
+  st.classList.toggle("arming", fs === "building");
 }
-function headerOffline() { $("liveStatus").classList.add("offline"); $("liveText").textContent = "RECONNECTING"; }
+function headerOffline() { connected = false; $("liveStatus").classList.add("offline"); $("liveText").textContent = "RECONNECTING"; }
 
 /* ---------- verdict hero ---------- */
 function renderVerdict(S) {
@@ -86,14 +106,35 @@ function renderVerdict(S) {
   const oraBad = ev.oracle.filter((o) => o.status === "breach").length, oraWarn = ev.oracle.filter((o) => o.status === "warn").length;
   const worstDev = oraRows.length ? oraRows[0] : null;
   const cons = S.conservation, cn = cons.rows.length, cx = cons.rows.filter((r) => r.status === "exact").length;
-  const capOk = S.meta.lastCycle && (Date.now() / 1000 - S.meta.lastCycle) < 90;
-
+  const capOk = S.meta.lastCycle && (stalenessAge(S.meta) || 0) < 90;
   const govBad = (S.governance && (S.governance.changes || []).length) || 0;
+  const govStale = !!(S.governance && S.governance.staleSections && S.governance.staleSections.length); // a critical section read failed (e.g. ER outage)
+  const oraDown = S.meta.oracleFeedCount === 0;   // the independent price source returned nothing → cross-check is blind
+  const covDegraded = !!S.meta.coverageDegraded;  // a custody scan shrank the tracked set → coverage not authoritative
+  const consOk = cn > 0 && cx === cn && !covDegraded;
+
+  const fs = freshnessState(S.meta);
+  const degraded = fs !== "live";
   const anyBreach = g.status === "breach" || tokBad || walBad || oraBad || govBad;
-  const anyWarn = g.status === "warn" || tokWarn || walWarn || oraWarn;
+  const anyWarn = g.status === "warn" || tokWarn || walWarn || oraWarn || oraDown || govStale || covDegraded || !consOk;
   const v = $("verdict");
-  v.classList.toggle("perfect", !anyBreach && !anyWarn);
-  if (anyBreach) {
+  v.classList.toggle("perfect", !degraded && !anyBreach && !anyWarn);
+  v.classList.toggle("degraded", degraded);
+
+  if (degraded) {
+    // NEVER show a confident green verdict while blind: building the window, unreachable, or the cycle
+    // loop wedged (stale). Render an explicit UNKNOWN state instead of the last cached green reading.
+    if (fs === "building") {
+      $("verdictFlag").innerHTML = `⏳ <span style="color:var(--amber)">ARMING GUARDS</span> — building the 24h window`;
+      $("verdictSub").textContent = "Loading transfer history from the chain. Guard readings are not authoritative yet — hold for the first full cycle.";
+    } else if (fs === "offline") {
+      $("verdictFlag").innerHTML = `⚠ <span style="color:var(--amber)">RECONNECTING</span> — monitor unreachable`;
+      $("verdictSub").textContent = "Cannot reach the monitor right now. The last reading may be stale — treat guard status as UNKNOWN until it reconnects.";
+    } else {
+      $("verdictFlag").innerHTML = `⚠ <span style="color:var(--amber)">MONITOR STALE</span> — cannot confirm guards`;
+      $("verdictSub").textContent = `No fresh cycle in ${Math.round(stalenessAge(S.meta) || 0)}s. The last reading may be out of date — guard status is UNKNOWN until the monitor catches up.`;
+    }
+  } else if (anyBreach) {
     $("verdictFlag").innerHTML = `⛔ <span style="color:var(--red)">${govBad ? "GOVERNANCE CHANGE" : "FLOW GUARD BREACH"}</span> — investigate now`;
     const parts = [];
     if (govBad) parts.push(`${govBad} authority/permission change${govBad > 1 ? "s" : ""} since baseline`);
@@ -104,7 +145,8 @@ function renderVerdict(S) {
     $("verdictSub").textContent = "Tripped: " + parts.join(" · ") + " — details in the panels and alert log below.";
   } else if (anyWarn) {
     $("verdictFlag").innerHTML = `⚠ <span style="color:var(--amber)">APPROACHING LIMITS</span>`;
-    $("verdictSub").textContent = `Warn-level utilization on ${[g.status === "warn" ? "the global cap" : null, tokWarn ? tokWarn + " token(s)" : null, walWarn ? walWarn + " wallet(s)" : null, oraWarn ? oraWarn + " oracle(s)" : null].filter(Boolean).join(", ")} — nothing breached.`;
+    const w = [g.status === "warn" ? "the global cap" : null, tokWarn ? tokWarn + " token(s)" : null, walWarn ? walWarn + " wallet(s)" : null, oraWarn ? oraWarn + " oracle(s)" : null, oraDown ? "oracle cross-check unavailable" : null, govStale ? "governance read incomplete" : null, covDegraded ? "vault coverage degraded" : null, !consOk && !covDegraded ? "conservation re-syncing" : null].filter(Boolean).join(", ");
+    $("verdictSub").textContent = `Attention on ${w} — nothing breached.`;
   } else {
     $("verdictFlag").innerHTML = `ALL FLOW GUARDS <span class="exact-word">GREEN</span>`;
     $("verdictSub").textContent = `Outflow across all ${ev.tokens.length} vaults is ${usd(g.out1hUsd)} this hour — ${g.utilization != null ? Math.round(g.utilization * 100) + "%" : "0%"} of the ${usd(g.limitUsdPerHour)}/hour global cap. Every transfer decoded from the base chain; conservation ${cx}/${cn} exact.`;
@@ -114,9 +156,9 @@ function renderVerdict(S) {
     vc(g.status === "ok", "GLOBAL OUT · 1H", g.utilization != null ? Math.round(g.utilization * 100) + "%" : "0%", `${usdc(g.out1hUsd)} of ${usdc(g.limitUsdPerHour)} cap`, "total outflow across ALL wallets vs the hourly cap"),
     vc(!tokBad && !tokWarn, "TOKEN GUARDS", tokBad ? tokBad + " BREACH" : tokWarn ? tokWarn + " WARN" : ev.tokens.length + " ✓", "per-vault caps + drawdown velocity"),
     vc(!walBad && !walWarn, "WALLET GUARD", walBad ? walBad + " BREACH" : walWarn ? walWarn + " WARN" : "clear", `top wallet ${ev.wallets[0] && ev.wallets[0].out1hUsd ? usdc(ev.wallets[0].out1hUsd) + " / 1h" : "$0 / 1h"}`),
-    vc(!oraBad && !oraWarn, "ORACLE GUARD", worstDev ? worstDev.deviationPct.toFixed(2) + "%" : "—", worstDev ? `worst: ${worstDev.symbol} vs Lazer` : "on-chain mark vs Pyth Lazer", "oracle-manipulation guard: a mark forged at the on-chain oracle diverges from a live Lazer read instantly"),
-    vc(!govBad, "GOVERNANCE", govBad ? govBad + " CHANGE" : "STABLE", S.governance && S.governance.upgradeControl && S.governance.upgradeControl.model === "squads-multisig" ? "Squads-gated upgrades · watched" : "authority surface watched", "upgrade authority, Squads control, program deploys, and permission flags — alerts on any change"),
-    vc(cx === cn, "CONSERVATION", `${cx}/${cn}`, "baseline+Σdeltas == balance (u64)", "proof the monitor missed nothing — raw u64, zero tolerance"),
+    vc(!oraBad && !oraWarn && !oraDown, "ORACLE GUARD", oraDown ? "—" : worstDev ? worstDev.deviationPct.toFixed(2) + "%" : "—", oraDown ? "cross-check feed unavailable" : worstDev ? `worst: ${esc(worstDev.symbol)} vs Lazer` : "on-chain mark vs Pyth Lazer", "oracle-manipulation guard: a mark forged at the on-chain oracle diverges from a live Lazer read instantly"),
+    vc(!govBad && !govStale, "GOVERNANCE", govBad ? govBad + " CHANGE" : govStale ? "READ DEGRADED" : "STABLE", govStale ? "a governance read failed this cycle — watch is degraded" : S.governance && S.governance.upgradeControl && S.governance.upgradeControl.model === "squads-multisig" ? "Squads-gated upgrades · watched" : "authority surface watched", "upgrade authority, Squads control, program deploys, and permission flags — alerts on any change"),
+    vc(consOk, "CONSERVATION", `${cx}/${cn}`, covDegraded ? "coverage degraded — see footer" : "baseline+Σdeltas == balance (u64)", "proof the monitor missed nothing — raw u64, zero tolerance"),
     vc(!!capOk, "CAPTURE", S.meta.wsPush ? "PUSH ⚡" : "POLL", `${S.failures1h} failed tx · 1h${S.meta.lastCycle ? " · " + ago(S.meta.lastCycle) + " ago" : ""}`, "WebSocket accountSubscribe on every vault + baseline poll"),
   ].join("");
 }
@@ -381,10 +423,12 @@ function renderWallets(S) {
 function renderOracle(S) {
   const rows = (S.evaluation && S.evaluation.oracle) || [];
   const bad = rows.filter((o) => o.status === "breach").length, warn = rows.filter((o) => o.status === "warn").length;
+  const live = rows.filter((o) => o.deviationPct != null).length; // rows with an actual live comparison this cycle
+  const oraDown = S.meta.oracleFeedCount === 0;                    // independent source returned no prices at all
   const src = S.meta.oracleSource === "lazer" ? "PYTH LAZER · DIRECT" : "PYTH LAZER · FLASH API";
   const tag = $("oraTag");
-  tag.textContent = (bad ? `${bad} DEVIATION BREACH` : warn ? `${warn} WARN` : "MARKS ALIGNED") + " · via " + src;
-  tag.className = "card-tag " + (bad ? "bad" : warn ? "warn" : "okk");
+  tag.textContent = (bad ? `${bad} DEVIATION BREACH` : warn ? `${warn} WARN` : oraDown ? "CROSS-CHECK DOWN" : live ? "MARKS ALIGNED" : "MARKETS IDLE") + " · via " + src;
+  tag.className = "card-tag " + (bad ? "bad" : warn || oraDown ? "warn" : "okk");
   tag.title = S.meta.lazer && S.meta.lazer.tokenPresent
     ? (S.meta.lazer.ok ? "prices from Pyth Lazer directly (third-party independent) — the exact feeds Flash uses" : `Lazer token present but failing (${S.meta.lazer.reason}) — using the Flash V2 API Lazer feed`)
     : "prices from the Flash V2 API Lazer feed (flashapi.trade/prices — a separate system from the on-chain oracle writer, so a forged mark diverges instantly); set LAZER_ACCESS_TOKEN for third-party-direct Lazer";
@@ -399,7 +443,7 @@ function renderOracle(S) {
       <td class="r" title="${esc(o.pythSymbol || "")}">${px(o.pythUsd)}</td>
       <td class="r">${o.deviationPct != null ? `${o.deviationPct.toFixed(2)}% ${meter(o.deviationPct / (o.limitPct || 1.5))}` : "—"}</td>
       <td class="c">${pill(o.status, o.status === "unmapped" ? "no confident independent feed match — reported, never guessed" : o.status === "stale" ? "mark or Pyth quote unavailable this cycle" : o.status === "inactive" ? "mark not updating (on-chain publish_time) — market paused/closed, deviation not evaluated; the guard re-arms automatically when the mark goes live" : `alarm at ${o.limitPct}% divergence`)}</td>
-    </tr>`; }).join("") || `<tr><td colspan="6" class="empty">no oracle rows</td></tr>`) + "</tbody>";
+    </tr>`; }).join("") || `<tr><td colspan="7" class="empty">no oracle rows</td></tr>`) + "</tbody>";
 }
 
 /* ---------- limits form ---------- */
@@ -503,14 +547,14 @@ function renderFeed(S) {
       newSet.add(e.sig + e.custody);
       const lat = e.observedAtMs != null && e.blockTime != null ? (e.observedAtMs / 1000 - e.blockTime) : null;
       return `<tr class="${isNew ? "feed-new" : ""}">
-      <td class="r" title="slot ${e.slot} · ${new Date(e.blockTime * 1000).toISOString()}">${utcHMS(e.blockTime)}<br><span class="dim">${ago(e.blockTime)} ago</span></td>
+      <td class="r" title="slot ${e.slot}${e.blockTime != null ? " · " + new Date(e.blockTime * 1000).toISOString() : " · block time pending"}">${e.blockTime != null ? utcHMS(e.blockTime) : "pending"}<br><span class="dim">${e.blockTime != null ? ago(e.blockTime) + " ago" : "unconfirmed"}</span></td>
       <td><b>${esc(e.symbol)}</b></td>
       <td>${poolPill(e.pool)}</td>
       <td><span class="kindtag" title="${esc((e.ix || []).join(" · "))}">${esc(e.kind)}</span>${e.internal ? ` <span class="gpill mut" title="vault→vault internal settlement — excluded from user inflow/outflow totals">INT</span>` : ""}</td>
       <td>${e.direction === "in" ? `<span class="dir-in">▲ IN</span>` : `<span class="dir-out">▼ OUT</span>`}</td>
       <td class="r" title="raw delta ${esc(e.deltaRaw)}">${amt(e.amount)}</td>
       <td class="r">${e.usd != null ? `<span class="${e.direction === "in" ? "dir-in" : "dir-out"}">${usd(e.usd)}</span>` : `<span class="dim" title="no oracle mark at capture — counted in totals as unpriced">unpriced</span>`}</td>
-      <td><a class="addr" href="${scanAcct(e.wallet)}" target="_blank" rel="noopener" title="${esc(e.wallet)}${e.counterparties && e.counterparties.length ? " · counterparties: " + e.counterparties.map((c) => c.owner).join(", ") : ""}">${short(e.wallet, 5)}</a></td>
+      <td><a class="addr" href="${scanAcct(e.wallet)}" target="_blank" rel="noopener" title="${esc(e.wallet)}${e.counterparties && e.counterparties.length ? " · counterparties: " + e.counterparties.map((c) => esc(c.owner)).join(", ") : ""}">${short(e.wallet, 5)}</a></td>
       <td><a class="addr" href="${scanTx(e.sig)}" target="_blank" rel="noopener">${short(e.sig, 5)}</a></td>
       <td class="r dim" title="seconds between the block and this monitor decoding the transfer">${lat != null && lat < 300 ? "+" + lat.toFixed(1) + "s" : lat != null ? "backfill" : "—"}</td>
     </tr>`; }).join("") || `<tr><td colspan="10" class="empty">no transfers match</td></tr>`) + "</tbody>";
@@ -567,19 +611,25 @@ async function refresh() {
     const r = await fetch("/api/state");
     if (!r.ok) throw new Error("api " + r.status);
     const S = await r.json();
-    lastState = S;
+    lastState = S; connected = true; lastFetchMs = Date.now();
     renderHeader(S); renderVerdict(S); renderKpis(S); renderChart(S); renderSides(S); renderMarkets(S);
     renderTokens(S); renderGovernance(S); renderWallets(S); renderOracle(S); renderLimits(S); renderFeed(S); renderAlerts(S); renderProof(S); renderFoot(S);
-  } catch (e) { headerOffline(); }
+  } catch (e) { headerOffline(); if (lastState) renderVerdict(lastState); } // reflect "unreachable" in the hero, not a stale green
 }
-let fastPoll = null;
+let fastPoll = null, sseRetry = 0, esConn = null;
+const stopFastPoll = () => { if (fastPoll) { clearInterval(fastPoll); fastPoll = null; } };
 function connectSSE() {
-  // local daemon pushes over SSE; on Vercel there is no SSE → fall back to 10s polling
+  // the daemon pushes over SSE; if it drops, fall back to polling AND keep trying to restore push —
+  // a brief network blip must never permanently downgrade the tab to forever-polling.
   try {
-    let fails = 0;
-    const es = new EventSource("/events");
-    es.addEventListener("cycle", () => { fails = 0; refresh(); });
-    es.onerror = () => { fails++; if (fails >= 2 && !fastPoll) { es.close(); fastPoll = setInterval(refresh, 10000); } };
+    esConn = new EventSource("/events");
+    esConn.addEventListener("cycle", () => { sseRetry = 0; stopFastPoll(); refresh(); }); // push restored → drop the poll
+    esConn.onerror = () => {
+      try { esConn.close(); } catch (_) {}
+      if (!fastPoll) fastPoll = setInterval(refresh, 10000);      // keep data flowing while push is down
+      sseRetry++;
+      setTimeout(connectSSE, Math.min(30000, 3000 * sseRetry));   // reconnect with backoff
+    };
   } catch (e) { if (!fastPoll) fastPoll = setInterval(refresh, 10000); }
 }
 ["mktFilter", "tokFilter", "feedFilter"].forEach((id) => $(id).addEventListener("input", () => lastState && (id === "mktFilter" ? renderMarkets(lastState) : id === "tokFilter" ? renderTokens(lastState) : renderFeed(lastState))));
@@ -591,5 +641,16 @@ document.addEventListener("click", async (e) => {
   try { await fetch("/api/ack?rule=" + encodeURIComponent(b.dataset.ack), { method: "POST" }); refresh(); }
   catch (err) { b.disabled = false; }
 });
-refresh(); connectSSE(); setInterval(refresh, 30000);
-setInterval(() => lastState && renderHeader(lastState), 1000); // live freshness ticker
+refresh(); connectSSE();
+// watchdog: only refetch if SSE + poll have both gone quiet (no redundant polling when push is healthy)
+setInterval(() => { if (!connected || Date.now() - lastFetchMs > 25000) refresh(); }, 15000);
+// 1s freshness ticker: keep the header pill AND the verdict honest about staleness even between fetches —
+// if the monitor goes quiet, the hero flips to STALE without waiting for the next successful fetch.
+let lastTickFs = "live";
+setInterval(() => {
+  if (!lastState) return;
+  renderHeader(lastState);
+  const st = freshnessState(lastState.meta);
+  if (st !== "live" || lastTickFs !== "live") renderVerdict(lastState);
+  lastTickFs = st;
+}, 1000);

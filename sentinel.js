@@ -18,6 +18,7 @@
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
+const crypto = require("crypto");
 const { makeRpc } = require("./lib/rpc.cjs");
 const { PROG, scanCustodies, scanMarkets, scanNamedVaults, describeVault, sweepAuthority, fetchMarks, fetchVaultBalances } = require("./lib/custodies.cjs");
 const { newSignatures, decodeFlow, classify } = require("./lib/flows.cjs");
@@ -82,6 +83,8 @@ const S = {
   alertsActive: {},          // ruleKey → { status, detail, since }
   alertsLog: [],             // recent transitions (also appended to alerts.jsonl)
   lastCycle: null, cycleSeconds: null, cycleErrors: [], cycles: 0,
+  ready: false,            // false until the initial backfill completes → suppresses a premature green verdict
+  coverageDegraded: null,  // set if a custody scan returned materially fewer vaults than the high-water mark
   sse: new Set(),
 };
 
@@ -265,13 +268,44 @@ function maybeSendWeekly() {
 }
 
 // ---------------- core cycle ----------------
+let custodyHighWater = 0;
 async function refreshCustodies() {
   const { custodies, pools, erSlot } = await scanCustodies(er);
-  if (custodies.length) { S.custodies = custodies; S.pools = pools; S.erSlot = erSlot; }
+  if (!custodies.length) return; // a fully-empty scan is a transient RPC failure — keep the last-good set
+  // Coverage-shrink guard: a partial/truncated getProgramAccounts (or one Borsh decode failure) must
+  // NOT silently replace the full set with a smaller one — that would shrink conservation coverage while
+  // still reporting "N/N exact" for the new smaller N. If the scan drops materially below the high-water
+  // mark, keep the prior set and raise a degraded signal instead of trusting the shrunken result.
+  if (custodyHighWater && custodies.length < custodyHighWater * 0.8) {
+    S.coverageDegraded = `custody scan returned ${custodies.length} vaults (expected ~${custodyHighWater}) — keeping last-good coverage`;
+    S.cycleErrors.push(S.coverageDegraded);
+    if (erSlot) S.erSlot = erSlot;
+    return;
+  }
+  S.custodies = custodies; S.pools = pools; S.erSlot = erSlot;
+  custodyHighWater = Math.max(custodyHighWater, custodies.length);
+  S.coverageDegraded = null;
 }
 const realC = () => S.custodies.filter((c) => !c.isVirtual); // custodies that own SPL vaults
 const tracked = () => [...realC(), ...S.named, ...Object.values(S.dynamic)]; // every fully-tracked vault
 const allDescriptors = () => [...S.custodies, ...S.named, ...Object.values(S.dynamic)];
+
+/** Re-price every in-window event at the CURRENT on-chain mark (stablecoins at $1) right before each
+ *  evaluation. An event that was unpriced at ingest (its mark not yet resolved) would otherwise
+ *  contribute $0 to the global/per-token/per-wallet USD caps forever — a drain routed through such a
+ *  token could stay under the dollar caps. This closes that gap and mirrors how vaultUsd/TVL are
+ *  valued (current mark). Raw deltas (deltaRaw/amount) are never touched — conservation stays exact. */
+function repriceEvents() {
+  const d = {}; for (const c of allDescriptors()) d[c.custody] = c;
+  const cutoff = now() - RETENTION_HOURS * 3600;
+  for (const e of S.events) {
+    if (e.blockTime == null || e.blockTime < cutoff) continue;
+    if (e.usd != null) continue; // keep the value observed at capture — only fill flows that were unpriced
+    const mark = S.marks[e.custody];
+    const px = mark != null && Number.isFinite(mark) ? mark : (d[e.custody] && d[e.custody].isStable ? 1 : null);
+    if (px != null) { e.usd = e.amount * px; e.markUsed = px; } // now priceable → counts toward the USD caps
+  }
+}
 
 /** Authority sweep: watch the balance of EVERY token account owned by the program's vault
  *  authority (2 RPC calls). Any untracked account that moves is promoted to full per-tx
@@ -331,7 +365,7 @@ function checkConservation() {
     const bal = S.balances[cust.vault];
     if (bal == null) continue;
     let c = S.conservation[cust.vault];
-    if (!c) { S.conservation[cust.vault] = { baseRaw: bal.toString(), baseTime: t, sumDeltas: "0", residual: "0", streak: 0, status: "exact", rebases: 0 }; continue; }
+    if (!c) { S.conservation[cust.vault] = { baseRaw: bal.toString(), baseTime: t, firstSeen: t, sumDeltas: "0", residual: "0", streak: 0, status: "exact", rebases: 0 }; continue; }
     const expect = BigInt(c.baseRaw) + BigInt(c.sumDeltas);
     const residual = bal - expect;
     c.residual = residual.toString();
@@ -341,9 +375,17 @@ function checkConservation() {
       if (c.streak <= 2) c.status = "syncing"; // a transfer can land between the sig scan and the balance read
       else {
         c.status = "drift";
-        const a = { time: t, rule: `conservation:${cust.pool}/${cust.symbol}`, from: "exact", to: "drift", detail: `residual ${residual} raw — rebasing baseline` };
-        S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a });
-        log(`CONSERVATION DRIFT ${cust.pool}/${cust.symbol} residual=${residual}`);
+        // A transfer that lands between a vault's signature scan and the balance read produces a
+        // transient residual right after startup that is NOT a missed transfer. Suppress the alert
+        // during the settle window (measured from when the vault was FIRST baselined, not from the last
+        // rebase — so a genuine persistent miss on a settled vault still re-alerts every ~3 cycles).
+        if (c.firstSeen == null) c.firstSeen = c.baseTime || t;
+        const settled = t - c.firstSeen > 180;
+        if (settled) {
+          const a = { time: t, rule: `conservation:${cust.pool}/${cust.symbol}`, from: "exact", to: "drift", detail: `residual ${residual} raw — rebasing baseline` };
+          S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a });
+          log(`CONSERVATION DRIFT ${cust.pool}/${cust.symbol} residual=${residual}`);
+        }
         c.baseRaw = bal.toString(); c.baseTime = t; c.sumDeltas = "0"; c.streak = 0; c.rebases++;
       }
     }
@@ -484,6 +526,7 @@ async function cycle(reason) {
     if (Date.now() - lastGovCheck > GOV_CHECK_MS) { await checkGovernance(); lastGovCheck = Date.now(); }
     S.events.sort((a, b) => a.blockTime - b.blockTime);
     pruneMemory();
+    repriceEvents(); // value unpriced-at-ingest flows at the current mark so they count toward the caps
     const ev = evaluate(now(), S.events, S.failures, allDescriptors(), S.balances, S.marks, S.markTimes, S.lazerMarks || {}, S.pyth, S.limits, S.authority);
     processAlertTransitions(ev);
     S.lastEval = ev;
@@ -530,6 +573,16 @@ function conservationRows() {
     };
   }).filter(Boolean);
 }
+// ---- security helpers ----
+// never expose a configured alert-webhook secret (Discord/Slack/relay URLs embed tokens) to public reads
+const publicLimits = (l) => ({ ...l, webhookUrl: l && l.webhookUrl ? "(configured)" : null });
+// constant-time write-token comparison over fixed-length digests (no length leak, no early-exit timing)
+const safeEq = (a, b) => { try { const h = (x) => crypto.createHash("sha256").update(String(x)).digest(); return crypto.timingSafeEqual(h(a), h(b)); } catch (e) { return false; } };
+// block SSRF: a webhook URL must be public http(s), never loopback/private/link-local
+const isPublicHttpUrl = (s) => { try { const u = new URL(s); if (u.protocol !== "http:" && u.protocol !== "https:") return false; const h = u.hostname.toLowerCase(); if (h === "localhost" || h.endsWith(".localhost") || h === "0.0.0.0" || h === "::1") return false; if (/^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) || /^169\.254\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h)) return false; if (h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80")) return false; return true; } catch (e) { return false; } };
+const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; object-src 'none'";
+const SEC_HEADERS = { "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer" };
+
 function snapshot() {
   const consRows = conservationRows();
   return {
@@ -538,21 +591,26 @@ function snapshot() {
       erSlot: S.erSlot, custodies: S.custodies.length, realVaults: realC().length, trackedVaults: tracked().length, markets: S.markets.length, pools: S.pools,
       sweep: { authority: S.authority, watched: Object.keys(S.sweepBal).length, promoted: Object.keys(S.dynamic).length, namedVaults: S.named.map((n) => `${n.pool}/${n.symbol}`) },
       startedAt: S.startedAt, lastCycle: S.lastCycle, cycleSeconds: S.cycleSeconds, pollMs: POLL_MS, cycles: S.cycles, wsPush: wsUp,
+      // freshness/coverage the client uses to gate the verdict: serverNow−lastCycle = true staleness even
+      // if the cycle loop wedges (the HTTP server keeps serving), backfilling until first full scan done.
+      serverNow: now(), ready: S.ready, backfilling: !S.ready, staleCutoffSec: Math.max(90, Math.round(POLL_MS / 1000) * 5),
+      oracleFeedCount: Object.keys(S.pyth.prices || {}).length, // 0 ⇒ independent cross-check is down (not "aligned")
+      coverageDegraded: S.coverageDegraded || null,
       backfillHours: BACKFILL_HOURS, retentionHours: RETENTION_HOURS, eventsRetained: S.events.length,
       cycleErrors: S.cycleErrors.slice(0, 8),
       oracleSource: S.pyth.source || "flash-api", lazer: { tokenPresent: !!S.lazer.token, ok: S.lazer.ok, reason: S.lazer.reason },
       channels: channelsConfigured(),
       squadsMofN: process.env.SQUADS_MOFN || "3-of-7", // Squads governance threshold (operator-set, verifiable on the Squads app)
       limitsWritable: HOST === "127.0.0.1" && !process.env.LIMITS_WRITE_TOKEN, // public view is read-only
-      dataNote: "All values decoded from real on-chain state: base-chain SPL transfers (exact u64 vault deltas from pre/post token balances, confirmed commitment), ER custody/oracle accounts via the program's own on-chain IDL, Pyth Lazer cross-check. Tracked vaults = every custody vault + TradeVault + RebateVault + FAF TokenVault, plus a balance sweep of EVERY token account owned by the program's vault authority — any untracked account that moves is auto-promoted to full per-transaction tracking. Capture is push-triggered by WebSocket accountSubscribe plus a baseline poll. USD at the on-chain oracle mark observed at ingest. No synthetic data.",
+      dataNote: "All values decoded from real on-chain state: base-chain SPL transfers (exact u64 vault deltas from pre/post token balances, confirmed commitment), ER custody/oracle accounts via the program's own on-chain IDL, Pyth Lazer cross-check. Tracked vaults = every custody vault + TradeVault + RebateVault + FAF TokenVault, plus a balance sweep of EVERY token account owned by the program's vault authority — any untracked account that moves is auto-promoted to full per-transaction tracking. Capture is push-triggered by WebSocket accountSubscribe plus a baseline poll. Each flow is valued in USD at the on-chain oracle mark observed at capture (stablecoins at $1); a flow whose mark was not yet resolved at capture is valued once its mark is available, and shown as unpriced until then — never dropped. No synthetic data.",
       guardNote: "Guards bound the drain class seen across perp DEXes: a manipulated or stale price feed generating fake profits that exit the vaults within minutes.",
     },
-    limits: S.limits,
+    limits: publicLimits(S.limits),
     evaluation: S.lastEval || null,
     markets: S.markets,
     hourly: hourlyBuckets(),
     hourlySides: hourlyBucketsBySide(now(), S.events, S.authority),
-    conservation: { rows: consRows, allExact: consRows.every((r) => r.status === "exact"), sinceOldestBase: consRows.length ? Math.min(...consRows.map((r) => r.baseTime)) : null },
+    conservation: { rows: consRows, allExact: consRows.length > 0 && consRows.every((r) => r.status === "exact"), sinceOldestBase: consRows.length ? Math.min(...consRows.map((r) => r.baseTime)) : null },
     governance: S.governance ? { ...S.governance, changes: S.govChanges.slice(-40).reverse() } : null,
     alerts: { active: S.alertsActive, log: S.alertsLog.slice(-100).reverse() },
     events: S.events.slice(-250).reverse().map((e) => ({ ...e, kind: classify(e.ix || [], e.direction), internal: !!(S.authority && e.wallet === S.authority) })),
@@ -568,7 +626,7 @@ function broadcast() {
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon" };
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, "http://x");
-  const send = (code, body, type = "application/json") => { res.writeHead(code, { "Content-Type": type, "Access-Control-Allow-Origin": "*" }); res.end(body); };
+  const send = (code, body, type = "application/json") => { res.writeHead(code, { "Content-Type": type, "Access-Control-Allow-Origin": "*", ...SEC_HEADERS }); res.end(body); };
   try {
     if (u.pathname === "/api/state") return send(200, JSON.stringify(snapshot()));
     if (u.pathname === "/api/events") {
@@ -584,7 +642,7 @@ const server = http.createServer((req, res) => {
     const isWrite = (u.pathname === "/api/ack" || u.pathname === "/api/limits") && req.method === "POST";
     if (isWrite) {
       if (WRITE_TOKEN) {
-        if (req.headers["x-limits-token"] !== WRITE_TOKEN) return send(403, JSON.stringify({ ok: false, error: "invalid x-limits-token" }));
+        if (!safeEq(req.headers["x-limits-token"], WRITE_TOKEN)) return send(403, JSON.stringify({ ok: false, error: "invalid x-limits-token" }));
       } else if (HOST !== "127.0.0.1") {
         return send(405, JSON.stringify({ ok: false, error: "writes disabled on the public deployment — set LIMITS_WRITE_TOKEN (and send it as x-limits-token) or edit limits from the local daemon" }));
       }
@@ -598,7 +656,7 @@ const server = http.createServer((req, res) => {
       saveState();
       return send(200, JSON.stringify({ ok: true, active: Object.keys(S.alertsActive) }));
     }
-    if (u.pathname === "/api/limits" && req.method === "GET") return send(200, JSON.stringify(S.limits));
+    if (u.pathname === "/api/limits" && req.method === "GET") return send(200, JSON.stringify(publicLimits(S.limits)));
     if (u.pathname === "/api/limits" && req.method === "POST") {
       let body = "";
       req.on("data", (c) => { body += c; if (body.length > 65536) req.destroy(); });
@@ -614,17 +672,18 @@ const server = http.createServer((req, res) => {
           if (num(j.perWalletOutflowUsdPerHour) !== undefined) patch.perWalletOutflowUsdPerHour = j.perWalletOutflowUsdPerHour;
           if (num(j.vaultDrawdownPctPerHour) !== undefined) patch.vaultDrawdownPctPerHour = j.vaultDrawdownPctPerHour;
           if (num(j.oracleDeviationPct) !== undefined) patch.oracleDeviationPct = j.oracleDeviationPct;
-          if (j.webhookUrl === null || (typeof j.webhookUrl === "string" && /^https?:\/\//.test(j.webhookUrl))) patch.webhookUrl = j.webhookUrl;
+          if (j.webhookUrl === null || (typeof j.webhookUrl === "string" && isPublicHttpUrl(j.webhookUrl))) patch.webhookUrl = j.webhookUrl;
           S.limits = { ...S.limits, ...patch };
           saveLimits();
           if (S.lastEval) { const ev = evaluate(now(), S.events, S.failures, allDescriptors(), S.balances, S.marks, S.markTimes, S.lazerMarks || {}, S.pyth, S.limits, S.authority); processAlertTransitions(ev); S.lastEval = ev; }
-          send(200, JSON.stringify({ ok: true, limits: S.limits }));
+          send(200, JSON.stringify({ ok: true, limits: publicLimits(S.limits) }));
         } catch (e) { send(400, JSON.stringify({ ok: false, error: e.message })); }
       });
       return;
     }
     if (u.pathname === "/events") {
-      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "Access-Control-Allow-Origin": "*" });
+      if (S.sse.size >= 512) { res.writeHead(503, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" }); res.end("too many streams"); return; } // cap concurrent SSE clients (FD/memory exhaustion guard)
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "Access-Control-Allow-Origin": "*", ...SEC_HEADERS });
       res.write("retry: 3000\n\n");
       S.sse.add(res);
       req.on("close", () => S.sse.delete(res));
@@ -636,11 +695,13 @@ const server = http.createServer((req, res) => {
     if (STATIC.has(name)) {
       // HTML must always revalidate (so new ?v= asset tags are picked up); assets are versioned → cacheable
       const cache = name === "index.html" ? "no-cache, must-revalidate" : "public, max-age=300";
-      res.writeHead(200, { "Content-Type": MIME[path.extname(name)] || "application/octet-stream", "Access-Control-Allow-Origin": "*", "Cache-Control": cache });
+      const hdrs = { "Content-Type": MIME[path.extname(name)] || "application/octet-stream", "Access-Control-Allow-Origin": "*", "Cache-Control": cache, ...SEC_HEADERS };
+      if (name === "index.html") hdrs["Content-Security-Policy"] = CSP; // XSS/clickjacking backstop on the document
+      res.writeHead(200, hdrs);
       return res.end(fs.readFileSync(path.join(__dirname, name)));
     }
     send(404, JSON.stringify({ error: "not found" }));
-  } catch (e) { send(500, JSON.stringify({ error: e.message })); }
+  } catch (e) { log("HTTP 500:", e.message); send(500, JSON.stringify({ error: "internal error" })); } // don't leak internals/paths
 });
 
 // ---------------- startup ----------------
@@ -691,6 +752,7 @@ const server = http.createServer((req, res) => {
     S.balances = await fetchVaultBalances(main, tracked());
     S.events.sort((a, b) => a.blockTime - b.blockTime);
     await refreshIndependentPrices();
+    repriceEvents();
     S.lastEval = evaluate(now(), S.events, S.failures, allDescriptors(), S.balances, S.marks, S.markTimes, S.lazerMarks || {}, S.pyth, S.limits, S.authority);
     S.lastCycle = now(); S.cycles = 1;
     log(`early paint from ${S.events.length} persisted events: 24h out $${S.lastEval.global.out24hUsd} in $${S.lastEval.global.in24hUsd}`);
@@ -713,9 +775,11 @@ const server = http.createServer((req, res) => {
   { const g = S.governance, ch = channelsConfigured();
     log(`governance: upgrade authority ${g && g.upgradeAuthority ? g.upgradeAuthority.slice(0, 6) + "…" : "?"}${g && g.upgradeControl ? " (control: " + g.upgradeControl.model + ")" : ""} · Squads ${process.env.SQUADS_MOFN || "3-of-7"} · alert channels: ${Object.entries(ch).filter(([, v]) => v).map(([k]) => k).join(", ") || "none (set TELEGRAM_*/SLACK_WEBHOOK_URL/HEARTBEAT_URL)"}`); }
   S.events.sort((a, b) => a.blockTime - b.blockTime);
+  repriceEvents();
   const ev = evaluate(now(), S.events, S.failures, allDescriptors(), S.balances, S.marks, S.markTimes, S.lazerMarks || {}, S.pyth, S.limits, S.authority);
   processAlertTransitions(ev);
   S.lastEval = ev;
+  S.ready = true; // initial backfill complete → guards are now authoritative (verdict may go green)
   S.lastCycle = now(); S.cycles = 1;
   saveState();
   log(`global outflow 1h: $${ev.global.out1hUsd} / $${ev.global.limitUsdPerHour} [${ev.global.status}] | 24h out $${ev.global.out24hUsd} in $${ev.global.in24hUsd}`);
