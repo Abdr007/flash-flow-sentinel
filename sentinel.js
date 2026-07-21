@@ -20,7 +20,8 @@ const path = require("path");
 const http = require("http");
 const crypto = require("crypto");
 const { makeRpc } = require("./lib/rpc.cjs");
-const { PROG, scanCustodies, scanMarkets, scanNamedVaults, describeVault, sweepAuthority, fetchMarks, fetchVaultBalances } = require("./lib/custodies.cjs");
+const { PROG, mergeSymbols, scanCustodies, scanMarkets, scanNamedVaults, describeVault, sweepAuthority, fetchMarks, fetchVaultBalances } = require("./lib/custodies.cjs");
+const { fetchPoolConfigSymbols } = require("./lib/poolconfig.cjs");
 const { newSignatures, decodeFlow, classify } = require("./lib/flows.cjs");
 const { fetchLazerMeta, fetchLazerLatest } = require("./lib/lazer.cjs");
 const { fetchFlashLazerPrices, fetchFlashLazerIds } = require("./lib/flashprices.cjs");
@@ -142,9 +143,11 @@ function pruneMemory() {
 }
 
 // ---------------- alerts ----------------
-function fireWebhook(a) {
-  // fan out to every configured channel (generic webhook + Telegram + Slack)
-  deliverAlert(a, { webhookUrl: S.limits.webhookUrl });
+function fireWebhook(a, tokens) {
+  // fan out to every configured channel (generic webhook + Telegram + Slack). `tokens` = the current
+  // evaluated on-chain token set, so Telegram can attach the matching chart image (defaults to the last
+  // evaluation for call sites — governance/conservation — that don't have it directly in scope).
+  deliverAlert(a, { webhookUrl: S.limits.webhookUrl, tokens: tokens || (S.lastEval && S.lastEval.tokens) || null });
 }
 function processAlertTransitions(ev) {
   const next = ruleStates(ev);
@@ -155,13 +158,13 @@ function processAlertTransitions(ev) {
       S.alertsActive[key] = { ...st, since: t };
       if (st.status !== "ok") { // never log/webhook a rule that starts green
         const a = { time: t, rule: key, from: "ok", to: st.status, detail: st.detail };
-        S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a });
+        S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a }, ev.tokens);
         log(`ALERT ${st.status.toUpperCase()} ${key} — ${st.detail}`);
       }
     } else if (prev.status !== st.status) {
       const a = { time: t, rule: key, from: prev.status, to: st.status, detail: st.detail };
       S.alertsActive[key] = { ...st, since: prev.since };
-      S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a });
+      S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a }, ev.tokens);
       log(`ALERT ${prev.status}→${st.status} ${key} — ${st.detail}`);
     } else {
       S.alertsActive[key].detail = st.detail;
@@ -721,6 +724,11 @@ const server = http.createServer((req, res) => {
   // "ARMING GUARDS…") during the initial backfill, instead of the container looking dead for ~60s.
   server.listen(PORT, HOST, () => log(`dashboard → http://${HOST}:${PORT}`));
 
+  // Resolve real symbols from Flash's LIVE pool-config manifest (source of truth, no stale SDK snapshot)
+  // BEFORE the first custody scan, so alerts/charts/labels show "GRAM"/"BP"/"ORE" instead of a mint prefix.
+  try { const added = mergeSymbols(await fetchPoolConfigSymbols("mainnet-beta")); log(`pool-config symbols merged: +${added} mints from live manifest`); }
+  catch (e) { log("pool-config symbols: " + (e.message || e)); }
+
   await refreshCustodies(); lastCustodyRefresh = Date.now();
   log(`custodies: ${S.custodies.length} total (${realC().length} real vaults) across ${S.pools} pools (ER slot ${S.erSlot})`);
 
@@ -739,7 +747,7 @@ const server = http.createServer((req, res) => {
   log(`vault authority ${S.authority ? S.authority.slice(0, 8) + "…" : "?"} — named vaults: ${S.named.map((n) => `${n.pool}/${n.symbol}`).join(", ") || "none"} · sweep watching ${Object.keys(S.sweepBal).length} token accounts (${Object.keys(S.dynamic).length} promoted)`);
 
   // official Lazer feed ids from Flash API /tokens (symbol → lazerId)
-  try { S.flashLazerIds = await fetchFlashLazerIds(); } catch (e) { log("flashapi /tokens: " + (e.message || e)); }
+  try { S.flashLazerIds = await fetchFlashLazerIds(); mergeSymbols((S.flashLazerIds && S.flashLazerIds.byMint) || null); } catch (e) { log("flashapi /tokens: " + (e.message || e)); }
   log(`price source: ${S.lazer.token ? "PYTH LAZER direct (token present)" : "Flash API Lazer feed (flashapi.trade/prices)"} · ${Object.keys((S.flashLazerIds && S.flashLazerIds.byMint) || {}).length} tokens in registry`);
 
   { const mk = await fetchMarks(er, main, allDescriptors()); S.marks = mk.marks; S.markTimes = mk.markTimes; S.lazerIds = mk.lazerIds || {}; S.lazerMarks = mk.lazerMarks || {}; }
