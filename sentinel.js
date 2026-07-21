@@ -578,7 +578,9 @@ function conservationRows() {
 }
 // ---- security helpers ----
 // never expose a configured alert-webhook secret (Discord/Slack/relay URLs embed tokens) to public reads
-const publicLimits = (l) => ({ ...l, webhookUrl: l && l.webhookUrl ? "(configured)" : null });
+// public view: never expose the alert-webhook secret, and never expose the operator watchlist
+// (a monitored-address list is operator-internal — leaking it tips off watched parties).
+const publicLimits = (l) => { const { watchWallets, ...rest } = l || {}; return { ...rest, webhookUrl: l && l.webhookUrl ? "(configured)" : null }; };
 // constant-time write-token comparison over fixed-length digests (no length leak, no early-exit timing)
 const safeEq = (a, b) => { try { const h = (x) => crypto.createHash("sha256").update(String(x)).digest(); return crypto.timingSafeEqual(h(a), h(b)); } catch (e) { return false; } };
 // block SSRF: a webhook URL must be public http(s), never loopback/private/link-local
