@@ -20,7 +20,7 @@ const path = require("path");
 const http = require("http");
 const crypto = require("crypto");
 const { makeRpc } = require("./lib/rpc.cjs");
-const { PROG, mergeSymbols, scanCustodies, scanMarkets, scanNamedVaults, describeVault, sweepAuthority, fetchMarks, fetchVaultBalances } = require("./lib/custodies.cjs");
+const { PROG, mergeSymbols, symbolForMint, scanCustodies, scanMarkets, scanNamedVaults, describeVault, sweepAuthority, fetchMarks, fetchVaultBalances } = require("./lib/custodies.cjs");
 const { fetchPoolConfigSymbols } = require("./lib/poolconfig.cjs");
 const { newSignatures, decodeFlow, classify } = require("./lib/flows.cjs");
 const { fetchLazerMeta, fetchLazerLatest } = require("./lib/lazer.cjs");
@@ -636,7 +636,10 @@ const server = http.createServer((req, res) => {
       const hours = Math.min(Number(u.searchParams.get("hours") || 24), RETENTION_HOURS);
       const limit = Math.min(Number(u.searchParams.get("limit") || 2000), 10000);
       const cutoff = now() - hours * 3600;
-      return send(200, JSON.stringify(S.events.filter((e) => e.blockTime >= cutoff).slice(-limit).reverse()));
+      // re-label each event's symbol from its mint against the CURRENT (merged) symbol map, so the feed
+      // never shows a stale mint prefix baked in when the event was first captured (pre-symbol-merge).
+      const relabel = (e) => { const s = symbolForMint(e.mint); return s && s !== e.symbol ? { ...e, symbol: s } : e; };
+      return send(200, JSON.stringify(S.events.filter((e) => e.blockTime >= cutoff).slice(-limit).reverse().map(relabel)));
     }
     // write-gate: mutations (limits, ack). Local loopback daemon = trusted (operator's machine).
     // Hosted (0.0.0.0): require LIMITS_WRITE_TOKEN via header; without it, writes are disabled so
