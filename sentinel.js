@@ -157,12 +157,12 @@ function processAlertTransitions(ev) {
     if (!prev) {
       S.alertsActive[key] = { ...st, since: t };
       if (st.status !== "ok") { // never log/webhook a rule that starts green
-        const a = { time: t, rule: key, from: "ok", to: st.status, detail: st.detail };
+        const a = { time: t, rule: key, from: "ok", to: st.status, detail: st.detail, severity: st.severity };
         S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a }, ev.tokens);
-        log(`ALERT ${st.status.toUpperCase()} ${key} — ${st.detail}`);
+        log(`ALERT ${(st.severity || st.status).toUpperCase()} ${key} — ${st.detail}`);
       }
     } else if (prev.status !== st.status) {
-      const a = { time: t, rule: key, from: prev.status, to: st.status, detail: st.detail };
+      const a = { time: t, rule: key, from: prev.status, to: st.status, detail: st.detail, severity: st.severity };
       S.alertsActive[key] = { ...st, since: prev.since };
       S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a }, ev.tokens);
       log(`ALERT ${prev.status}→${st.status} ${key} — ${st.detail}`);
