@@ -331,7 +331,9 @@ function renderGovernance(S) {
 
   const ch = S.meta.channels || {};
   const on = Object.entries(ch).filter(([, v]) => v).map(([k]) => k);
-  const ackBtn = changes ? ` <button class="ptok-btn" data-ack="all" title="clear latched governance alerts after review">ACKNOWLEDGE ALL</button>` : "";
+  // operator-only: the acknowledge control is a write action — only show it to the operator (loopback),
+  // never on the public read-only site (server 405s a public POST anyway, but the button shouldn't show).
+  const ackBtn = changes && S.meta && S.meta.limitsWritable ? ` <button class="ptok-btn" data-ack="all" title="clear latched governance alerts after review">ACKNOWLEDGE ALL</button>` : "";
   $("govChannels").innerHTML = `<span><b>Alert delivery:</b> ${on.length ? on.map((c) => `<span class="gpill ok">${esc(c)}</span>`).join(" ") : '<span class="gpill mut">none configured — set TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID / SLACK_WEBHOOK_URL / HEARTBEAT_URL</span>'}${ackBtn}</span><span class="dim">● = money-path permission (highest severity on flip)</span>`;
 }
 
