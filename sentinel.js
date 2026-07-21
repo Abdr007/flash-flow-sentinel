@@ -658,7 +658,10 @@ const server = http.createServer((req, res) => {
     // acknowledge (clear) a latched governance alert after a human has reviewed it
     if (u.pathname === "/api/ack" && req.method === "POST") {
       const rule = u.searchParams.get("rule");
-      if (rule === "all") { for (const k of Object.keys(S.alertsActive)) if (k.startsWith("gov:")) delete S.alertsActive[k]; }
+      // rule=all: clear the latched governance alerts AND the change log that drives the red verdict.
+      // The baseline is already advanced to current on each detection, so clearing the log won't re-fire
+      // the same (already-reviewed) changes; only a NEW change re-latches.
+      if (rule === "all") { for (const k of Object.keys(S.alertsActive)) if (k.startsWith("gov:")) delete S.alertsActive[k]; S.govChanges = []; }
       else if (rule && S.alertsActive[rule]) delete S.alertsActive[rule];
       else return send(404, JSON.stringify({ ok: false, error: "no such active alert" }));
       saveState();
