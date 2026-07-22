@@ -27,7 +27,7 @@ const { fetchLazerMeta, fetchLazerLatest } = require("./lib/lazer.cjs");
 const { fetchFlashLazerPrices, fetchFlashLazerIds } = require("./lib/flashprices.cjs");
 const { DEFAULT_LIMITS, evaluate, ruleStates, hourlyBucketsBySide } = require("./lib/limits.cjs");
 const { fetchGovernance, diffGovernance, mergeGovernance } = require("./lib/authority.cjs");
-const { deliverAlert, heartbeat, sendTelegram, sendOperator, sendWithdrawalNotice, channelsConfigured } = require("./lib/notify.cjs");
+const { deliverAlert, heartbeat, sendTelegram, sendOperator, sendSecurityAlert, sendWithdrawalNotice, channelsConfigured } = require("./lib/notify.cjs");
 const reconwatch = require("./lib/reconwatch.cjs");
 
 // ---------------- config ----------------
@@ -81,6 +81,8 @@ const S = {
   authorizedUpgrades: [],    // program upgrades AUTO-VERIFIED as authorized (multisig, authority unchanged) — informational review-log, NOT red
   wAlertFrom: 0,             // watermark: only notify withdrawals at/after this ts (set when the feed is enabled — never dump the backlog)
   wAlertSent: [],            // capped list of already-notified withdrawal keys (sig:custody) so none is sent twice
+  wSummaryLast: 0,           // last hourly-summary send (persisted) — one summary per WSUMMARY_INTERVAL, no spam
+  wFreshToken: null,         // last WITHDRAWAL_FRESH_START value applied
   lastDigestUnix: 0,         // last daily-digest broadcast (persisted; survives restarts)
   lastWeeklyUnix: 0,         // last weekly deep-dive broadcast (persisted)
   pyth: { feeds: {}, prices: {}, source: "flash-api" },
@@ -119,13 +121,14 @@ function loadState() {
     S.wAlertFrom = j.wAlertFrom || 0;
     S.wAlertSent = j.wAlertSent || [];
     S.wFreshToken = j.wFreshToken || null;
+    S.wSummaryLast = j.wSummaryLast || 0;
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
+  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
   // ATOMIC write: a crash mid-write must never leave a half-written state file (which would wipe the sent-
   // history on reboot and re-send withdrawals). Write to a temp file, then rename — rename is atomic on the
   // volume's filesystem, so readers only ever see a complete file.
@@ -175,19 +178,25 @@ function processAlertTransitions(ev) {
   // team it must NOT be pushed to the main channel. We still record it on the dashboard + alert log; we just
   // suppress the external notification for oracle:* rules.
   const pushAlert = (a, tokens) => { if (!String(a.rule || "").startsWith("oracle:")) fireWebhook(a, tokens); };
+  // SECURITY alert → operator DM (bypasses the global mute when SECURITY_ALERTS=1). Fires ONLY on the genuine
+  // exploit signature — a per-wallet over-withdrawal (entitlement) — never on routine volume, so it can't spam.
+  const secSend = (key, st) => {
+    if (!SECURITY_ALERTS() || st.status !== "breach") return;
+    if (key.startsWith("entitlement:")) sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nOVER-WITHDRAWAL DETECTED\n\n${String(st.detail || "").replace(/^⚠ CRITICAL — entitlement anomaly:\s*/, "")}\n\n🔗 flash-flow-sentinel.vercel.app`);
+  };
   for (const [key, st] of Object.entries(next)) {
     const prev = S.alertsActive[key];
     if (!prev) {
       S.alertsActive[key] = { ...st, since: t };
       if (st.status !== "ok") { // never log/webhook a rule that starts green
         const a = { time: t, rule: key, from: "ok", to: st.status, detail: st.detail, severity: st.severity };
-        S.alertsLog.push(a); appendAlert(a); pushAlert({ source: "flash-flow-sentinel", ...a }, ev.tokens);
+        S.alertsLog.push(a); appendAlert(a); pushAlert({ source: "flash-flow-sentinel", ...a }, ev.tokens); secSend(key, st);
         log(`ALERT ${(st.severity || st.status).toUpperCase()} ${key} — ${st.detail}`);
       }
     } else if (prev.status !== st.status) {
       const a = { time: t, rule: key, from: prev.status, to: st.status, detail: st.detail, severity: st.severity };
       S.alertsActive[key] = { ...st, since: prev.since };
-      S.alertsLog.push(a); appendAlert(a); pushAlert({ source: "flash-flow-sentinel", ...a }, ev.tokens);
+      S.alertsLog.push(a); appendAlert(a); pushAlert({ source: "flash-flow-sentinel", ...a }, ev.tokens); secSend(key, st);
       log(`ALERT ${prev.status}→${st.status} ${key} — ${st.detail}`);
     } else {
       S.alertsActive[key].detail = st.detail; S.alertsActive[key].severity = st.severity; // keep severity fresh even when status is unchanged (e.g. a threat escalating within "breach")
@@ -421,6 +430,11 @@ function checkConservation() {
         if (settled) {
           const a = { time: t, rule: `conservation:${cust.pool}/${cust.symbol}`, from: "exact", to: "drift", detail: `residual ${residual} raw — rebasing baseline` };
           S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a });
+          if (SECURITY_ALERTS()) {
+            const tokAmt = Number(residual) / Math.pow(10, cust.decimals || 0), mk = S.marks[cust.custody];
+            const usd = mk != null && Number.isFinite(tokAmt) ? ` (~$${Math.abs(tokAmt * mk).toLocaleString("en-US", { maximumFractionDigits: 0 })})` : "";
+            sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nCONSERVATION DRIFT\n\nVault ${cust.pool}/${cust.symbol} no longer reconciles:\nbaseline + Σ transfers ≠ live balance\nresidual ${tokAmt >= 0 ? "+" : "−"}${Math.abs(tokAmt).toFixed(4)} ${cust.symbol}${usd}\n\n⚠️ A transfer was missed or forged — investigate immediately.`);
+          }
           log(`CONSERVATION DRIFT ${cust.pool}/${cust.symbol} residual=${residual}`);
         }
         c.baseRaw = bal.toString(); c.baseTime = t; c.sumDeltas = "0"; c.streak = 0; c.rebases++;
@@ -464,6 +478,7 @@ async function checkGovernance() {
     const a = { time: t, rule: ch.key, from: "ok", to: "breach", severity: ch.severity, detail: ch.detail };
     S.govChanges.push(a); S.alertsActive[ch.key] = { status: "breach", severity: ch.severity, detail: ch.detail, since: t };
     S.alertsLog.push(a); appendAlert(a); fireWebhook(a);
+    if (SECURITY_ALERTS()) sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nGOVERNANCE CHANGE\n\n${ch.detail}\n\n⚠️ Verify this change was authorized.`);
     log(`GOVERNANCE ${ch.severity.toUpperCase()} ${ch.key} — ${ch.detail}`);
   }
   S.govBaseline = gov;
@@ -502,8 +517,8 @@ async function checkReconciliation() {
   for (const m of fresh) {
     const detail = reconwatch.describe(m);
     log(`RECON CRITICAL — new phantom position: ${detail}`);
-    // OPERATOR DM ONLY (private) — not the public channel, per standing instruction until promoted.
-    sendOperator(`🔴 FLASH FLOW SENTINEL — RECONCILIATION ANOMALY (NEW phantom position)\n\n${detail}\n\nA market's open interest no longer matches the baskets behind it — the on-chain fingerprint of an over-withdrawal / broken-entitlement path being exercised. This is the signal the 07-20 rehearsal left a day before the live drain. Investigate before it can be drained.\n\nCensus: flashtrade-v2-onchain-census.vercel.app`);
+    // SECURITY → operator DM (bypasses the global mute when SECURITY_ALERTS=1). A NEW phantom is rare and real.
+    if (SECURITY_ALERTS()) sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nNEW PHANTOM POSITION\n\n${detail}\n\nA market no longer matches the baskets behind it — the on-chain fingerprint of an over-withdrawal path being exercised.\n\n🔗 flashtrade-v2-onchain-census.vercel.app`);
   }
   for (const m of resolved) log(`RECON resolved — ${m.pool}/${m.market} ${m.side} reconciles again`);
   if (fresh.length || resolved.length) saveState();
@@ -515,10 +530,36 @@ async function checkReconciliation() {
 // the first time it runs so the existing backlog is NEVER dumped; dedup by sig:custody so none is sent twice.
 // Bypasses the global mute on purpose (this is the one feed explicitly turned on) and carries no oracle content.
 const WITHDRAWAL_ALERTS = () => process.env.WITHDRAWAL_ALERTS === "1";
+const SECURITY_ALERTS = () => process.env.SECURITY_ALERTS === "1";
+const WMODE = () => (process.env.WITHDRAWAL_MODE === "pertx" ? "pertx" : "summary"); // default: low-noise hourly summary
+const WSUMMARY_INTERVAL = Number(process.env.WSUMMARY_INTERVAL_S || 3600);
 const wKey = (e) => `${e.sig}:${e.custody}`;
 let wSending = false; // one send-batch at a time so a burst is never double-sent across overlapping cycles
+
+// HOURLY SUMMARY (default, no-spam): one message/hour with the last hour's real decoded totals — withdrawals,
+// deposits, net, TVL. Never posted until a real evaluation exists (never synthetic/empty). Inherently dedup-safe
+// (one per interval, tracked by wSummaryLast). All numbers come straight from the live on-chain evaluation.
+function notifyWithdrawalSummary() {
+  const t = now();
+  if (!S.wSummaryLast) { S.wSummaryLast = t; saveState(); log("withdrawal HOURLY SUMMARY enabled — first roundup in ~1h (real on-chain totals)"); return; }
+  if (t - S.wSummaryLast < WSUMMARY_INTERVAL) return;
+  const ev = S.lastEval;
+  if (!ev || !ev.global) return; // wait for a real evaluation — never post empty/synthetic
+  S.wSummaryLast = t; saveState();
+  const g = ev.global;
+  const tvl = (ev.tokens || []).reduce((s, tk) => s + (tk.vaultUsd || 0), 0);
+  const fmt = (n) => { const a = Math.abs(n || 0); return a >= 1e6 ? "$" + (a / 1e6).toFixed(2) + "M" : a >= 1e3 ? "$" + (a / 1e3).toFixed(1) + "k" : "$" + Math.round(a).toLocaleString("en-US"); };
+  const net = (g.in1hUsd || 0) - (g.out1hUsd || 0);
+  const bar = "━━━━━━━━━━━━━━━━━━━━";
+  sendWithdrawalNotice(`📊  FLASH V2  ·  HOURLY REPORT\n${bar}\n💸  Withdrawals   ${g.outEvents1h || 0}  ·  ${fmt(g.out1hUsd)}\n💰  Deposits      ${g.inEvents1h || 0}  ·  ${fmt(g.in1hUsd)}\n⚖️  Net flow      ${net >= 0 ? "+" : "−"}${fmt(net)}\n🏦  Vault TVL     ${fmt(tvl)}\n${bar}\n✅  Live on-chain · verified`);
+}
+
+// Dispatcher — default mode posts the hourly summary above (no spam); WITHDRAWAL_MODE=pertx uses the
+// dedup-hardened per-transaction feed below. Every value is decoded live on-chain; nothing is ever synthetic.
 function notifyWithdrawals() {
-  if (!WITHDRAWAL_ALERTS() || wSending) return;
+  if (!WITHDRAWAL_ALERTS()) return;
+  if (WMODE() === "summary") return notifyWithdrawalSummary();
+  if (wSending) return;
   // One-time FRESH START: whenever WITHDRAWAL_FRESH_START changes value, reset the feed to *now* — clear the
   // watermark to this instant and wipe the sent-history — so (re)enabling posts only brand-new transactions
   // with zero backlog and zero chance of repeating anything sent before. Runs once per new token value.
