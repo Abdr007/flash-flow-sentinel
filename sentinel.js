@@ -351,9 +351,20 @@ async function pollVault(cust, cutoff) {
       } else {
         S.eventKeys.add(k); // confirmed tx that didn't move the vault — remember, don't refetch
       }
+      if (S.decodeRetries && S.decodeRetries[k]) delete S.decodeRetries[k]; // decoded fine — clear any retry count
     } catch (err) {
-      S.cycleErrors.push(`decode ${s.signature.slice(0, 12)}…: ${err.message}`);
-      break; // don't advance lastSig past an undecoded tx
+      const retries = (S.decodeRetries || (S.decodeRetries = {}));
+      const rc = (retries[k] = (retries[k] || 0) + 1);
+      if (rc < 6) { S.cycleErrors.push(`decode ${s.signature.slice(0, 12)}…: ${err.message} (retry ${rc}/6)`); break; } // transient — retry next cycle, don't advance past it
+      // persistently undecodable after 6 cycles: SKIP so this vault's stream isn't wedged forever. Mark
+      // processed (lastSig advances) and flag loudly. Any real vault delta it carried is still caught by
+      // the conservation proof (baseline + Σdeltas ≠ balance → drift alert), so nothing is silently lost.
+      S.eventKeys.add(k); delete retries[k];
+      const skip = (S.skippedSigs || (S.skippedSigs = []));
+      skip.push({ vault: cust.vault, pool: cust.pool, symbol: cust.symbol, sig: s.signature, blockTime: s.blockTime, error: err.message, at: now() });
+      if (skip.length > 100) S.skippedSigs = skip.slice(-100);
+      log(`⚠️ SKIPPED undecodable tx after 6 retries: ${s.signature} (${cust.pool}/${cust.symbol}) — ${err.message}. Conservation drift will catch any missed delta.`);
+      // fall through (no break) — keep processing the rest of the vault's signatures
     }
   }
   // advance lastSig only through the fully processed prefix (an undecoded tx is retried next cycle)
@@ -623,6 +634,7 @@ function snapshot() {
       coverageDegraded: S.coverageDegraded || null,
       backfillHours: BACKFILL_HOURS, retentionHours: RETENTION_HOURS, eventsRetained: S.events.length,
       cycleErrors: S.cycleErrors.slice(0, 8),
+      skippedTxs: (S.skippedSigs || []).slice(-10).reverse(), // txs skipped after 6 undecodable retries (conservation drift still backstops any missed delta)
       oracleSource: S.pyth.source || "flash-api", lazer: { tokenPresent: !!S.lazer.token, ok: S.lazer.ok, reason: S.lazer.reason },
       channels: channelsConfigured(),
       squadsMofN: process.env.SQUADS_MOFN || "3-of-7", // Squads governance threshold (operator-set, verifiable on the Squads app)
