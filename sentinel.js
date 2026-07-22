@@ -27,7 +27,7 @@ const { fetchLazerMeta, fetchLazerLatest } = require("./lib/lazer.cjs");
 const { fetchFlashLazerPrices, fetchFlashLazerIds } = require("./lib/flashprices.cjs");
 const { DEFAULT_LIMITS, evaluate, ruleStates, hourlyBucketsBySide } = require("./lib/limits.cjs");
 const { fetchGovernance, diffGovernance, mergeGovernance } = require("./lib/authority.cjs");
-const { deliverAlert, heartbeat, sendTelegram, sendOperator, channelsConfigured } = require("./lib/notify.cjs");
+const { deliverAlert, heartbeat, sendTelegram, sendOperator, sendWithdrawalNotice, channelsConfigured } = require("./lib/notify.cjs");
 const reconwatch = require("./lib/reconwatch.cjs");
 
 // ---------------- config ----------------
@@ -79,6 +79,8 @@ const S = {
   govBaseline: null,         // last-good full governance snapshot for change detection (persisted)
   govChanges: [],            // recorded governance changes (also alerts) — drives the red governance verdict
   authorizedUpgrades: [],    // program upgrades AUTO-VERIFIED as authorized (multisig, authority unchanged) — informational review-log, NOT red
+  wAlertFrom: 0,             // watermark: only notify withdrawals at/after this ts (set when the feed is enabled — never dump the backlog)
+  wAlertSent: [],            // capped list of already-notified withdrawal keys (sig:custody) so none is sent twice
   lastDigestUnix: 0,         // last daily-digest broadcast (persisted; survives restarts)
   lastWeeklyUnix: 0,         // last weekly deep-dive broadcast (persisted)
   pyth: { feeds: {}, prices: {}, source: "flash-api" },
@@ -114,13 +116,15 @@ function loadState() {
     S.reconKnown = j.reconKnown || {};        // persist known phantom mismatches so a restart doesn't re-alert them
     S.reconSeeded = !!j.reconSeeded;
     S.authorizedUpgrades = j.authorizedUpgrades || [];
+    S.wAlertFrom = j.wAlertFrom || 0;
+    S.wAlertSent = j.wAlertSent || [];
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  fs.writeFileSync(F_STATE, JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2));
+  fs.writeFileSync(F_STATE, JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-800), lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2));
 }
 function loadEvents() {
   const cutoff = now() - RETENTION_HOURS * 3600;
@@ -499,6 +503,37 @@ async function checkReconciliation() {
   if (fresh.length || resolved.length) saveState();
 }
 
+// ---------------- withdrawal firehose (Flash team request — notify on every withdrawal, ~24h resumption) ----------------
+// When WITHDRAWAL_ALERTS=1, push a Telegram notice for EVERY new withdrawal (non-internal vault outflow),
+// BATCHED one message per cycle to stay well under Telegram rate limits. A watermark (wAlertFrom) is stamped
+// the first time it runs so the existing backlog is NEVER dumped; dedup by sig:custody so none is sent twice.
+// Bypasses the global mute on purpose (this is the one feed explicitly turned on) and carries no oracle content.
+const WITHDRAWAL_ALERTS = () => process.env.WITHDRAWAL_ALERTS === "1";
+const wKey = (e) => `${e.sig}:${e.custody}`;
+function notifyWithdrawals() {
+  if (!WITHDRAWAL_ALERTS()) return;
+  if (!S.wAlertFrom) { S.wAlertFrom = now(); log("withdrawal feed ENABLED — watermark set; notifying on all withdrawals from now (backlog not dumped)"); return; }
+  const sent = S._wSent || (S._wSent = new Set(S.wAlertSent || []));
+  const fresh = S.events.filter((e) => e.direction === "out" && e.sig && !(S.authority && e.wallet === S.authority) && e.blockTime >= S.wAlertFrom && !sent.has(wKey(e)));
+  if (!fresh.length) return;
+  fresh.sort((a, b) => a.blockTime - b.blockTime);
+  const money = (n) => (n == null ? "—" : "$" + Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+  const short = (w) => (w ? w.slice(0, 6) + "…" + w.slice(-4) : "?");
+  const CAP = 12, shown = fresh.slice(0, CAP); // 12 lines × long solscan URLs stays safely under Telegram's 4096-char limit
+  let text;
+  if (shown.length === 1) {
+    const e = shown[0];
+    text = `💸 WITHDRAWAL · Flash V2\n${money(e.usd)}  ${e.symbol} (${e.pool}) → ${short(e.wallet)} · ${e.kind}\nhttps://solscan.io/tx/${e.sig}`;
+  } else {
+    text = `💸 ${fresh.length} WITHDRAWALS · Flash V2\n\n` + shown.map((e) => `• ${money(e.usd)} ${e.symbol} (${e.pool}) → ${short(e.wallet)} · ${e.kind}\n  https://solscan.io/tx/${e.sig}`).join("\n");
+    if (fresh.length > CAP) text += `\n\n…+${fresh.length - CAP} more this cycle (see dashboard)`;
+  }
+  sendWithdrawalNotice(text);
+  for (const e of fresh) sent.add(wKey(e));
+  S.wAlertSent = [...sent].slice(-1500);
+  S._wSent = new Set(S.wAlertSent);
+}
+
 // ---------------- realtime push: WebSocket accountSubscribe on every vault ----------------
 // Any balance change on any custody vault triggers an immediate decode cycle (~1s after the
 // block) instead of waiting for the next poll. Baseline polling remains the safety net.
@@ -615,6 +650,7 @@ async function cycle(reason) {
     S.events.sort((a, b) => a.blockTime - b.blockTime);
     pruneMemory();
     repriceEvents(); // value unpriced-at-ingest flows at the current mark so they count toward the caps
+    try { notifyWithdrawals(); } catch (e) { S.cycleErrors.push("wnotify: " + e.message); } // never let the firehose break the cycle
     const ev = evaluate(now(), S.events, S.failures, allDescriptors(), S.balances, S.marks, S.markTimes, S.lazerMarks || {}, S.pyth, S.limits, S.authority);
     processAlertTransitions(ev);
     S.lastEval = ev;
