@@ -832,6 +832,7 @@ const server = http.createServer((req, res) => {
       // rule=all: clear the latched governance alerts AND the change log that drives the red verdict.
       // The baseline is already advanced to current on each detection, so clearing the log won't re-fire
       // the same (already-reviewed) changes; only a NEW change re-latches.
+      if (rule === "wreset") { S.wAlertFrom = now(); S.wAlertSent = []; S._wSent = new Set(); saveState(); return send(200, JSON.stringify({ ok: true, withdrawalFeed: "reset to now — every withdrawal from this instant posts to the main channel, no gaps, no dupes" })); }
       if (rule === "all") { for (const k of Object.keys(S.alertsActive)) if (k.startsWith("gov:")) delete S.alertsActive[k]; S.govChanges = []; }
       else if (rule && S.alertsActive[rule]) delete S.alertsActive[rule];
       else return send(404, JSON.stringify({ ok: false, error: "no such active alert" }));
