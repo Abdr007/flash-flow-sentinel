@@ -83,6 +83,8 @@ const S = {
   wAlertSent: [],            // capped list of already-notified withdrawal keys (sig:custody) so none is sent twice
   wSummaryLast: 0,           // last hourly-summary send (persisted) — one summary per WSUMMARY_INTERVAL, no spam
   wFreshToken: null,         // last WITHDRAWAL_FRESH_START value applied
+  knownPrograms: {},         // programId → firstSeen — every program ever seen touching Flash vaults (new-program detector)
+  progSeeded: false,         // once true, the existing program set is baselined; only NEW programs alert
   lastDigestUnix: 0,         // last daily-digest broadcast (persisted; survives restarts)
   lastWeeklyUnix: 0,         // last weekly deep-dive broadcast (persisted)
   pyth: { feeds: {}, prices: {}, source: "flash-api" },
@@ -122,13 +124,15 @@ function loadState() {
     S.wAlertSent = j.wAlertSent || [];
     S.wFreshToken = j.wFreshToken || null;
     S.wSummaryLast = j.wSummaryLast || 0;
+    S.knownPrograms = j.knownPrograms || {};
+    S.progSeeded = !!j.progSeeded;
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
+  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
   // ATOMIC write: a crash mid-write must never leave a half-written state file (which would wipe the sent-
   // history on reboot and re-send withdrawals). Write to a temp file, then rename — rename is atomic on the
   // volume's filesystem, so readers only ever see a complete file.
@@ -183,6 +187,7 @@ function processAlertTransitions(ev) {
   const secSend = (key, st) => {
     if (!SECURITY_ALERTS() || st.status !== "breach") return;
     if (key.startsWith("entitlement:")) sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nOVER-WITHDRAWAL DETECTED\n\n${String(st.detail || "").replace(/^⚠ CRITICAL — entitlement anomaly:\s*/, "")}\n\n🔗 flash-flow-sentinel.vercel.app`);
+    else if (key === "probe-cluster") sendSecurityAlert(`🟠  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nPOSSIBLE EXPLOIT REHEARSAL\n\n${String(st.detail || "").replace(/^⚠ /, "")}\n\n⚠️ Multiple fresh wallets are testing the deposit/withdraw path without extracting — the fingerprint that preceded the live drain. Investigate early.`);
   };
   for (const [key, st] of Object.entries(next)) {
     const prev = S.alertsActive[key];
@@ -605,6 +610,35 @@ function notifyWithdrawals() {
   })();
 }
 
+// ---------------- new-program detector (earliest exploit-rehearsal footprint) ----------------
+// The attacker's very first move was deploying a custom program and pointing it at Flash. This flags the
+// moment a program NEVER seen touching Flash vaults before starts appearing in vault transactions. The
+// existing program set is baselined once (seed) so routine infra (Token/System/Flash/Squads/MagicBlock/
+// integrations) never alerts; only a genuinely new program does — one alert per program. Security DM only.
+function checkNewPrograms() {
+  if (!SECURITY_ALERTS()) return;
+  const t = now();
+  const seen = new Set();
+  for (const e of S.events) if (Array.isArray(e.programs)) for (const p of e.programs) seen.add(p);
+  if (!seen.size) return;
+  if (!S.progSeeded) {
+    for (const p of seen) if (!S.knownPrograms[p]) S.knownPrograms[p] = t;
+    S.progSeeded = true; saveState();
+    log(`NEW-PROGRAM detector seeded: ${Object.keys(S.knownPrograms).length} programs baselined (only new ones alert from here)`);
+    return;
+  }
+  const fresh = [...seen].filter((p) => !S.knownPrograms[p]);
+  if (!fresh.length) return;
+  for (const p of fresh) {
+    S.knownPrograms[p] = t;
+    const evs = S.events.filter((e) => Array.isArray(e.programs) && e.programs.includes(p));
+    const sample = evs[evs.length - 1];
+    log(`NEW PROGRAM touching Flash vaults: ${p} (${evs.length} tx)`);
+    sendSecurityAlert(`🟠  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nNEW PROGRAM TOUCHING FLASH\n\nA program never seen before is interacting with Flash vaults:\n${p}\n${sample ? `\ne.g. ${sample.pool}/${sample.symbol} · https://solscan.io/tx/${sample.sig}` : ""}\n\n⚠️ An unknown program touching vaults can be an early attack footprint (the attacker deployed one before the drain). Verify it's a known integration.`);
+  }
+  saveState();
+}
+
 // ---------------- realtime push: WebSocket accountSubscribe on every vault ----------------
 // Any balance change on any custody vault triggers an immediate decode cycle (~1s after the
 // block) instead of waiting for the next poll. Baseline polling remains the safety net.
@@ -722,6 +756,7 @@ async function cycle(reason) {
     pruneMemory();
     repriceEvents(); // value unpriced-at-ingest flows at the current mark so they count toward the caps
     try { notifyWithdrawals(); } catch (e) { S.cycleErrors.push("wnotify: " + e.message); } // never let the firehose break the cycle
+    try { checkNewPrograms(); } catch (e) { S.cycleErrors.push("newprog: " + e.message); } // new-program detector (rehearsal footprint)
     const ev = evaluate(now(), S.events, S.failures, allDescriptors(), S.balances, S.marks, S.markTimes, S.lazerMarks || {}, S.pyth, S.limits, S.authority);
     processAlertTransitions(ev);
     S.lastEval = ev;
