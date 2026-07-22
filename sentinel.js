@@ -755,6 +755,7 @@ function snapshot() {
       erSlot: S.erSlot, custodies: S.custodies.length, realVaults: realC().length, trackedVaults: tracked().length, markets: S.markets.length, pools: S.pools,
       sweep: { authority: S.authority, watched: Object.keys(S.sweepBal).length, promoted: Object.keys(S.dynamic).length, namedVaults: S.named.map((n) => `${n.pool}/${n.symbol}`) },
       startedAt: S.startedAt, lastCycle: S.lastCycle, cycleSeconds: S.cycleSeconds, pollMs: POLL_MS, cycles: S.cycles, wsPush: wsUp, cycleWedges,
+      wFeed: WITHDRAWAL_ALERTS() ? { on: true, sinceUnix: S.wAlertFrom, sentCount: (S.wAlertSent || []).length, sending: wSending } : { on: false },
       // freshness/coverage the client uses to gate the verdict: serverNow−lastCycle = true staleness even
       // if the cycle loop wedges (the HTTP server keeps serving), backfilling until first full scan done.
       // Stale cutoff adapts to how long a cycle actually takes on the current RPC (a full poll of 52 vaults
