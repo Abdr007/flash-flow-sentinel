@@ -28,6 +28,7 @@ const { fetchFlashLazerPrices, fetchFlashLazerIds } = require("./lib/flashprices
 const { DEFAULT_LIMITS, evaluate, ruleStates, hourlyBucketsBySide } = require("./lib/limits.cjs");
 const { fetchGovernance, diffGovernance, mergeGovernance } = require("./lib/authority.cjs");
 const { deliverAlert, heartbeat, sendTelegram, sendOperator, sendSecurityAlert, sendWithdrawalNotice, channelsConfigured } = require("./lib/notify.cjs");
+const containment = require("./lib/containment.cjs"); // Layer 3 — proof-gated auto-containment
 const reconwatch = require("./lib/reconwatch.cjs");
 
 // ---------------- config ----------------
@@ -87,6 +88,7 @@ const S = {
   progSeeded: false,         // once true, the existing program set is baselined; only NEW programs alert
   probeFunders: {},          // probe wallet → funding source (in-memory cache; re-traced on restart, only runs when a cluster exists)
   probeClusterKey: null,     // latch: last-alerted coordinated-cluster signature (funder:count) so a proven cluster alarms once
+  containment: { trips: {}, lastTrip: null, checked: {} }, // Layer 3: proven-drain trips (persisted) + in-memory verify cache
   lastDigestUnix: 0,         // last daily-digest broadcast (persisted; survives restarts)
   lastWeeklyUnix: 0,         // last weekly deep-dive broadcast (persisted)
   pyth: { feeds: {}, prices: {}, source: "flash-api" },
@@ -129,13 +131,14 @@ function loadState() {
     S.knownPrograms = j.knownPrograms || {};
     S.progSeeded = !!j.progSeeded;
     S.probeClusterKey = j.probeClusterKey || null;
+    S.containment = { trips: (j.containment && j.containment.trips) || {}, lastTrip: (j.containment && j.containment.lastTrip) || null, checked: {} };
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, probeClusterKey: S.probeClusterKey, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
+  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
   // ATOMIC write: a crash mid-write must never leave a half-written state file (which would wipe the sent-
   // history on reboot and re-send withdrawals). Write to a temp file, then rename — rename is atomic on the
   // volume's filesystem, so readers only ever see a complete file.
@@ -751,6 +754,48 @@ async function checkProbeCluster(ev) {
   } finally { probeBusy = false; }
 }
 
+// ─── LAYER 3: AUTO-CONTAINMENT ───────────────────────────────────────────────
+// Nominates candidates from the live eval, proves over-withdrawal on-chain (full-history),
+// and on PROOF fires the automated response: max-priority alert + signed-intent webhook to
+// Flash's authorized responder. Latched (contains once per wallet). Gated by CONTAINMENT=1.
+let containBusy = false;
+async function runContainment(ev) {
+  if (!containment.CONTAINMENT() || containBusy) return;
+  const c = containment.cfg();
+  const cands = containment.selectCandidates(ev, c);
+  if (!cands.length) return;
+  containBusy = true;
+  try {
+    const flashVaults = new Set(Object.keys(S.balances || {})); // vault token accounts — counterparty check for the proof
+    let traced = 0;
+    for (const cand of cands) {
+      const w = cand.wallet;
+      if (S.containment.trips[w]) continue;                                  // already contained — latched
+      const seen = S.containment.checked[w];
+      if (seen && (now() - seen.ts) < 1800 && !cand.entitlement) continue;   // don't re-trace an entitled/capped wallet within 30m unless entitlement-flagged
+      if (traced >= 3) break;                                                // bound on-chain proof work per cycle (rest re-checked next cycle)
+      traced++;
+      const proof = await containment.verifyDrain(w, main, c, flashVaults);
+      S.containment.checked[w] = { ts: now(), capped: proof.capped, proven: proof.proven };
+      if (!proof.proven) {
+        if (proof.capped) log(`containment: ${w.slice(0, 8)} withdrew $${Math.round(cand.out1hUsd)}/1h but ${proof.reason} → escalated, NOT auto-contained`);
+        continue;
+      }
+      // PROVEN DRAIN → CONTAIN (latch, alarm, signal)
+      S.containment.trips[w] = { wallet: w, lifetimeOut: proof.lifetimeOut, lifetimeIn: proof.lifetimeIn, ratio: proof.ratio === Infinity ? null : proof.ratio, txCount: proof.txCount, sigs: proof.sigs, at: now(), mode: containment.MODE() };
+      S.containment.lastTrip = now();
+      saveState();
+      log(`🚨🚨 CONTAINMENT TRIPPED: ${w} — proven over-withdrawal $${Math.round(proof.lifetimeOut)} out vs $${Math.round(proof.lifetimeIn)} in (${proof.txCount}-tx full history)`);
+      sendSecurityAlert(containment.buildAlarmText(proof, c)); // max-priority DM (containment is its own gate; fires even if SECURITY_ALERTS/mute are off)
+      if (c.webhook && isPublicHttpUrl(c.webhook)) {
+        fetch(c.webhook, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(containment.buildPayload(proof, c)), signal: AbortSignal.timeout(8000) })
+          .then((r) => log(`containment signal POSTed to responder → ${r && r.ok ? "accepted" : "non-200"}`))
+          .catch((e) => log(`containment webhook failed: ${e.message}`));
+      }
+    }
+  } finally { containBusy = false; }
+}
+
 // ---------------- realtime push: WebSocket accountSubscribe on every vault ----------------
 // Any balance change on any custody vault triggers an immediate decode cycle (~1s after the
 // block) instead of waiting for the next poll. Baseline polling remains the safety net.
@@ -872,6 +917,7 @@ async function cycle(reason) {
     const ev = evaluate(now(), S.events, S.failures, allDescriptors(), S.balances, S.marks, S.markTimes, S.lazerMarks || {}, S.pyth, S.limits, S.authority);
     processAlertTransitions(ev);
     checkProbeCluster(ev).catch((e) => S.cycleErrors.push("probe: " + (e.message || e))); // proven-only coordinated-cluster (common-funder) verify → DM
+    runContainment(ev).catch((e) => S.cycleErrors.push("contain: " + (e.message || e)));  // Layer 3: proven-drain full-history verify → auto-response
     S.lastEval = ev;
     saveState();
     S.lastCycle = now(); S.cycleSeconds = +((Date.now() - t0) / 1000).toFixed(1); S.cycles++;
@@ -986,6 +1032,8 @@ function snapshot() {
     // reconciliation-anomaly watch: live basket-vs-market phantom-position count + the set currently open.
     // A NEW phantom is the 7-day-rehearsal fingerprint (over-withdrawal path being exercised) — alerted privately.
     reconciliation: S.reconStatus ? { ...S.reconStatus, openPhantoms: Object.values(S.reconKnown).map((m) => ({ market: m.market, side: m.side, pool: m.pool, posDiff: m.posDiff, firstSeen: m.firstSeen })) } : null,
+    // Layer 3 auto-containment posture + any proven-drain trips (proof-gated; sentinel holds no pause key by design).
+    containment: { ...containment.posture(containment.cfg()), lastTrip: S.containment.lastTrip, trips: Object.values(S.containment.trips).slice(-10).reverse() },
     governance: S.governance ? { ...S.governance, changes: S.govChanges.slice(-40).reverse(), authorizedUpgrades: S.authorizedUpgrades.slice(-20).reverse() } : null,
     alerts: redactWatchedAlerts(S.alertsActive, S.alertsLog.slice(-100).reverse()),
     events: S.events.slice(-250).reverse().map((e) => ({ ...e, kind: classify(e.ix || [], e.direction), internal: !!(S.authority && e.wallet === S.authority) })),
@@ -1013,6 +1061,20 @@ const server = http.createServer((req, res) => {
       const relabel = (e) => { const s = symbolForMint(e.mint); return s && s !== e.symbol ? { ...e, symbol: s } : e; };
       return send(200, JSON.stringify(S.events.filter((e) => e.blockTime >= cutoff).slice(-limit).reverse().map(relabel)));
     }
+    // DRY-RUN containment proof for ANY wallet (demo the Layer-3 verifier on the historical attacker, etc.).
+    // Read-only: no alarm, no webhook, no state change — but heavy RPC, so operator-gated (write token / loopback).
+    if (u.pathname === "/api/containment/verify" && req.method === "GET") {
+      const tok = process.env.LIMITS_WRITE_TOKEN;
+      if (tok ? !safeEq(req.headers["x-limits-token"], tok) : HOST !== "127.0.0.1")
+        return send(403, JSON.stringify({ ok: false, error: "operator-gated (heavy RPC): send x-limits-token or run on the local daemon" }));
+      const wallet = u.searchParams.get("wallet");
+      if (!wallet || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(wallet)) return send(400, JSON.stringify({ ok: false, error: "valid ?wallet= required" }));
+      const c = containment.cfg();
+      containment.verifyDrain(wallet, main, c, new Set(Object.keys(S.balances || {})))
+        .then((v) => send(200, JSON.stringify({ ok: true, dryRun: true, wouldContain: v.proven, verdict: v })))
+        .catch((e) => send(500, JSON.stringify({ ok: false, error: e.message })));
+      return;
+    }
     // write-gate: mutations (limits, ack). Local loopback daemon = trusted (operator's machine).
     // Hosted (0.0.0.0): require LIMITS_WRITE_TOKEN via header; without it, writes are disabled so
     // a public visitor can never change your caps. Reads always stay open.
@@ -1036,6 +1098,7 @@ const server = http.createServer((req, res) => {
       // The baseline is already advanced to current on each detection, so clearing the log won't re-fire
       // the same (already-reviewed) changes; only a NEW change re-latches.
       if (rule === "wreset") { S.wAlertFrom = now(); S.wAlertSent = []; S._wSent = new Set(); saveState(); return send(200, JSON.stringify({ ok: true, withdrawalFeed: "reset to now — every withdrawal from this instant posts to the main channel, no gaps, no dupes" })); }
+      if (rule === "containment") { const n = Object.keys(S.containment.trips).length; S.containment.trips = {}; S.containment.checked = {}; S.containment.lastTrip = null; saveState(); return send(200, JSON.stringify({ ok: true, containment: `re-armed — cleared ${n} trip(s); wallets will be re-verified on next activity` })); }
       if (rule === "all") { for (const k of Object.keys(S.alertsActive)) if (k.startsWith("gov:")) delete S.alertsActive[k]; S.govChanges = []; }
       else if (rule && S.alertsActive[rule]) delete S.alertsActive[rule];
       else return send(404, JSON.stringify({ ok: false, error: "no such active alert" }));
