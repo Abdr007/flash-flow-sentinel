@@ -256,12 +256,15 @@ function renderLayers(S) {
   const oraBad = (ev.oracle || []).filter((o) => o.status === "breach").length, oraDown = S.meta.oracleFeedCount === 0;
   const govBad = (S.governance && (S.governance.changes || []).length) || 0;
   const phantom = (S.reconciliation && S.reconciliation.mismatched) || 0;
-  const l2bad = tokBad || oraBad || govBad || phantom || g.status === "breach";
-  const l2warn = !consOk || oraDown || g.status === "warn";
+  const sv = (S.reconciliation && S.reconciliation.solvency) || null;
+  const svBlind = !sv || !sv.present || sv.stale, svOk = !!(sv && sv.present && sv.allHold && !sv.stale), svBad = !!(sv && sv.present && !sv.allHold && !sv.stale);
+  const l2bad = tokBad || oraBad || govBad || phantom || svBad || g.status === "breach";
+  const l2warn = !consOk || oraDown || svBlind || g.status === "warn";
   const l2 = [
     li(g.status === "breach" ? "bad" : g.status === "warn" ? "warn" : "ok", "risk", "Outflow velocity", (g.utilization != null ? Math.round(g.utilization * 100) : 0) + "% of cap"),
     li(tokBad ? "bad" : "ok", "risk", "Net-drawdown / token caps", tokBad ? tokBad + " breach" : ev.tokens.length + " ok"),
     li(consOk ? "ok" : "warn", "proof", "Conservation (raw u64)", cn ? cx + "/" + cn + (consOk ? " exact" : " syncing") : "—"),
+    li(svBad ? "bad" : svBlind ? "warn" : "ok", "proof", "Protocol solvency (census)", svBlind ? "cross-check offline" : svBad ? ((sv.fails || []).length + " FAILED") : "all invariants hold"),
     li(oraBad ? "bad" : oraDown ? "warn" : "ok", "risk", "Oracle cross-check (Lazer)", oraDown ? "feed down" : (S.meta.oracleFeedCount || 0) + " feeds · " + oraBad + " dev"),
     li(govBad ? "bad" : "ok", "proof", "Governance / authority", govBad ? govBad + " change" : "stable"),
     li(phantom ? "bad" : "ok", "proof", "Phantom-position recon", phantom ? phantom + " open" : "0 phantoms"),

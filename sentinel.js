@@ -506,24 +506,56 @@ async function checkGovernance() {
 // the 2026-07-20 rehearsal left on-chain a full day before the live drain, which nothing alerted on.
 // Alerts route to the OPERATOR DM ONLY (private) — never the public channel — until explicitly promoted.
 async function checkReconciliation() {
-  let recon;
+  let full;
   try {
     // Hard ceiling independent of fetch's own AbortSignal, so a stalled census body-read can never hold the
     // cycle. If it loses the race the reject is caught below and the cycle proceeds untouched.
-    recon = await Promise.race([
-      reconwatch.fetchReconciliation(),
+    full = await Promise.race([
+      reconwatch.fetchCensusFull(),
       new Promise((_, rej) => setTimeout(() => rej(new Error("recon timeout (30s)")), 30000)),
     ]);
-  } catch (e) { S.cycleErrors.push("recon: " + e.message); return; }
+  } catch (e) {
+    // The census is a SECOND independent witness of solvency — losing it must NOT be silent. Alarm the operator
+    // (rate-limited to once / 30m) that the solvency cross-check has gone blind, then proceed; the sentinel's own
+    // flow/entitlement/conservation guards are unaffected.
+    S.cycleErrors.push("recon: " + e.message);
+    const t0 = now();
+    if (SECURITY_ALERTS() && (!S.censusBlindSince || t0 - S.censusBlindSince > 1800)) {
+      S.censusBlindSince = t0;
+      sendSecurityAlert(`🟠  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nSOLVENCY CROSS-CHECK BLIND\n\nThe on-chain census (independent solvency witness) is unreachable: ${e.message}.\nProtocol-solvency + phantom-position checks are paused until it returns — the sentinel's own guards are unaffected.\n\n🔗 flashtrade-v2-onchain-census.vercel.app`);
+    }
+    return;
+  }
+  if (S.censusBlindSince) { S.censusBlindSince = null; log("RECON: census reachable again"); }
+  const recon = full.recon, inv = full.inv;
   const t = now();
-  S.reconStatus = { mismatched: recon.mismatchedCount, marketSides: recon.marketSides, allExact: recon.allExact, checkedAt: t };
+  const stale = inv.asOfUnix != null && (t - inv.asOfUnix) > 1800; // census scan older than 30m → not a live witness
+  S.reconStatus = { mismatched: recon.mismatchedCount, marketSides: recon.marketSides, allExact: recon.allExact, checkedAt: t,
+    solvency: { present: inv.present, allHold: inv.allHold, fails: inv.fails, asOfUnix: inv.asOfUnix, stale, coveragePct: inv.coveragePct, deficit: inv.deficit } };
 
-  // Cold start: silently baseline whatever mismatch already exists (e.g. the known SOL-Short residue) so a
-  // pre-existing phantom is never fired as if it were brand-new. Only mismatches appearing AFTER this alert.
+  // ---- PROTOCOL SOLVENCY INVARIANTS (the single strongest signal) ----
+  // If the census's own on-chain invariants FAIL, the protocol is provably insolvent / being drained. CRITICAL,
+  // raw-u64, computed on an INDEPENDENT scan. Latched so it alarms once on break and once on recovery; only ever
+  // trusted when the invariant suite is present AND the census scan is fresh.
+  if (inv.present && !stale) {
+    if (!inv.allHold && !S.censusInvariantBad) {
+      S.censusInvariantBad = true; saveState();
+      log(`RECON CRITICAL — census solvency invariant FAILED: ${inv.fails.join("; ")}`);
+      if (SECURITY_ALERTS()) sendSecurityAlert(`🔴🔴 SECURITY · FLASH V2 🔴🔴\n━━━━━━━━━━━━━━━━━━━━\nPROTOCOL SOLVENCY INVARIANT FAILED\n\nThe on-chain census proves ${inv.fails.length} invariant(s) NO LONGER HOLD:\n• ${inv.fails.join("\n• ")}${inv.deficit ? `\n\nVault deficit: ${inv.deficit}` : ""}\n\n⚠️ PROVEN on-chain (raw u64, independent scan): the protocol is under-collateralised or being drained. Strongest signal the monitor has — ACT NOW.\n\n🔗 flashtrade-v2-onchain-census.vercel.app`);
+    } else if (inv.allHold && S.censusInvariantBad) {
+      S.censusInvariantBad = false; saveState();
+      log("RECON — census solvency invariants hold again");
+      if (SECURITY_ALERTS()) sendSecurityAlert(`🟢  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nSOLVENCY RESTORED\n\nAll on-chain census invariants hold again (${inv.coveragePct || "?"} coverage).`);
+    }
+  }
+
+  // Cold start: silently baseline whatever phantom mismatch already exists so a pre-existing one is never fired
+  // as if it were brand-new — BUT surface the count so a restart-after-attack can't hide a planted phantom.
   if (!S.reconSeeded) {
     const n = reconwatch.seed(S.reconKnown, recon.mismatched, t);
     S.reconSeeded = true;
-    log(`RECON seeded: ${n} pre-existing mismatch(es) baselined silently (${recon.marketSides} sides, ${recon.mismatchedCount} mismatched)`);
+    log(`RECON seeded: ${n} pre-existing mismatch(es) baselined (${recon.marketSides} sides, ${recon.mismatchedCount} mismatched)`);
+    if (n > 0 && SECURITY_ALERTS()) sendSecurityAlert(`🟠  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nPHANTOM POSITION(S) PRESENT AT STARTUP\n\n${n} basket-vs-market mismatch(es) already existed when the monitor started — baselined so they don't re-fire, but REVIEW them (a planted phantom could predate a restart):\n${recon.mismatched.slice(0, 4).map((m) => "• " + reconwatch.describe(m)).join("\n")}\n\n🔗 flashtrade-v2-onchain-census.vercel.app`);
     saveState();
     return;
   }
