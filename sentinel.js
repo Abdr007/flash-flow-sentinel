@@ -105,13 +105,14 @@ function loadState() {
     S.dynamic = j.dynamic || {};             // promoted accounts stay fully tracked
     S.govBaseline = j.govBaseline || null;   // detect governance changes across restarts too
     S.govChanges = j.govChanges || [];
+    S.conservation = j.conservation || {};   // persist the conservation baseline so a restart can't re-baseline away a pre-existing missed-transfer drift (false "exact")
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  fs.writeFileSync(F_STATE, JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2));
+  fs.writeFileSync(F_STATE, JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2));
 }
 function loadEvents() {
   const cutoff = now() - RETENTION_HOURS * 3600;
@@ -167,7 +168,7 @@ function processAlertTransitions(ev) {
       S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a }, ev.tokens);
       log(`ALERT ${prev.status}→${st.status} ${key} — ${st.detail}`);
     } else {
-      S.alertsActive[key].detail = st.detail;
+      S.alertsActive[key].detail = st.detail; S.alertsActive[key].severity = st.severity; // keep severity fresh even when status is unchanged (e.g. a threat escalating within "breach")
     }
   }
   for (const key of Object.keys(S.alertsActive)) {
@@ -306,7 +307,7 @@ function repriceEvents() {
     if (e.usd != null) continue; // keep the value observed at capture — only fill flows that were unpriced
     const mark = S.marks[e.custody];
     const px = mark != null && Number.isFinite(mark) ? mark : (d[e.custody] && d[e.custody].isStable ? 1 : null);
-    if (px != null) { e.usd = e.amount * px; e.markUsed = px; } // now priceable → counts toward the USD caps
+    if (px != null) { const v = e.amount * px; if (Number.isFinite(v)) { e.usd = v; e.markUsed = px; } } // now priceable → counts toward the USD caps (never let a NaN/Infinity into the totals — that would read as green)
   }
 }
 
@@ -417,7 +418,7 @@ async function checkGovernance() {
   if (!changes.length) { S.govBaseline = gov; return; }   // fingerprint moved only on a skipped section → no wolf
   for (const ch of changes) {
     const a = { time: t, rule: ch.key, from: "ok", to: "breach", severity: ch.severity, detail: ch.detail };
-    S.govChanges.push(a); S.alertsActive[ch.key] = { status: "breach", detail: ch.detail, since: t };
+    S.govChanges.push(a); S.alertsActive[ch.key] = { status: "breach", severity: ch.severity, detail: ch.detail, since: t };
     S.alertsLog.push(a); appendAlert(a); fireWebhook(a);
     log(`GOVERNANCE ${ch.severity.toUpperCase()} ${ch.key} — ${ch.detail}`);
   }
@@ -584,10 +585,29 @@ const publicLimits = (l) => { const { watchWallets, ...rest } = l || {}; return 
 // constant-time write-token comparison over fixed-length digests (no length leak, no early-exit timing)
 const safeEq = (a, b) => { try { const h = (x) => crypto.createHash("sha256").update(String(x)).digest(); return crypto.timingSafeEqual(h(a), h(b)); } catch (e) { return false; } };
 // block SSRF: a webhook URL must be public http(s), never loopback/private/link-local
-const isPublicHttpUrl = (s) => { try { const u = new URL(s); if (u.protocol !== "http:" && u.protocol !== "https:") return false; const h = u.hostname.toLowerCase(); if (h === "localhost" || h.endsWith(".localhost") || h === "0.0.0.0" || h === "::1") return false; if (/^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) || /^169\.254\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h)) return false; if (h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80")) return false; return true; } catch (e) { return false; } };
+const isPublicHttpUrl = (s) => { try { const u = new URL(s); if (u.protocol !== "http:" && u.protocol !== "https:") return false; let h = u.hostname.toLowerCase(); if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1); // unwrap IPv6 literal so the checks below see the raw address
+  if (h === "localhost" || h.endsWith(".localhost") || h === "0.0.0.0" || h === "::1" || h === "::") return false;
+  if (/^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) || /^169\.254\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h)) return false;
+  // IPv6 private/loopback/link-local + IPv4-mapped loopback (::ffff:127.x). fc00::/7, fe80::/10, ::1.
+  if (/^fc/.test(h) || /^fd/.test(h) || /^fe[89ab]/.test(h) || /^::ffff:(127|10|0)\./.test(h) || /^::1$/.test(h)) return false;
+  return true; } catch (e) { return false; } };
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; object-src 'none'";
 const SEC_HEADERS = { "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer" };
 
+// The operator watchlist is internal — /api/state is public, so scrub any signal of WHICH wallets are
+// watched: drop the `watched` flag, drop pure `watch:` alerts, and remove "on watchlist" from details.
+// (Never mutates the shared S.lastEval / S.alertsActive — builds shallow copies.)
+function redactWatchedEval(ev) {
+  if (!ev || !Array.isArray(ev.wallets)) return ev;
+  return { ...ev, wallets: ev.wallets.map((w) => (w && w.watched ? { ...w, watched: undefined } : w)) };
+}
+function redactWatchedAlerts(active, log) {
+  const scrub = (d) => (typeof d === "string" ? d.replace(/on watchlist; ?/gi, "").replace(/WATCHED wallet active/gi, "wallet active") : d);
+  const a = {};
+  for (const [k, v] of Object.entries(active || {})) { if (k.startsWith("watch:")) continue; a[k] = v && v.detail ? { ...v, detail: scrub(v.detail) } : v; }
+  const l = (log || []).filter((x) => !String(x && x.rule || "").startsWith("watch:")).map((x) => (x && x.detail ? { ...x, detail: scrub(x.detail) } : x));
+  return { active: a, log: l };
+}
 function snapshot() {
   const consRows = conservationRows();
   return {
@@ -611,13 +631,13 @@ function snapshot() {
       guardNote: "Guards bound the drain class seen across perp DEXes: a manipulated or stale price feed generating fake profits that exit the vaults within minutes.",
     },
     limits: publicLimits(S.limits),
-    evaluation: S.lastEval || null,
+    evaluation: redactWatchedEval(S.lastEval) || null,
     markets: S.markets,
     hourly: hourlyBuckets(),
     hourlySides: hourlyBucketsBySide(now(), S.events, S.authority),
     conservation: { rows: consRows, allExact: consRows.length > 0 && consRows.every((r) => r.status === "exact"), sinceOldestBase: consRows.length ? Math.min(...consRows.map((r) => r.baseTime)) : null },
     governance: S.governance ? { ...S.governance, changes: S.govChanges.slice(-40).reverse() } : null,
-    alerts: { active: S.alertsActive, log: S.alertsLog.slice(-100).reverse() },
+    alerts: redactWatchedAlerts(S.alertsActive, S.alertsLog.slice(-100).reverse()),
     events: S.events.slice(-250).reverse().map((e) => ({ ...e, kind: classify(e.ix || [], e.direction), internal: !!(S.authority && e.wallet === S.authority) })),
     failures1h: S.failures.filter((f) => f.blockTime >= now() - 3600).length,
     pythFeeds: Object.keys(S.pyth.feeds).length,
@@ -649,6 +669,10 @@ const server = http.createServer((req, res) => {
     const WRITE_TOKEN = process.env.LIMITS_WRITE_TOKEN;
     const isWrite = (u.pathname === "/api/ack" || u.pathname === "/api/limits") && req.method === "POST";
     if (isWrite) {
+      // CSRF guard: /api/ack is a bodyless "simple" POST, so a malicious page could fire it cross-site
+      // at the loopback daemon with no preflight. Reject any browser request whose Sec-Fetch-Site says
+      // it's cross-site. Non-browser clients (curl/operator scripts) don't send the header → allowed.
+      if (String(req.headers["sec-fetch-site"] || "").toLowerCase() === "cross-site") return send(403, JSON.stringify({ ok: false, error: "cross-site write blocked" }));
       if (WRITE_TOKEN) {
         if (!safeEq(req.headers["x-limits-token"], WRITE_TOKEN)) return send(403, JSON.stringify({ ok: false, error: "invalid x-limits-token" }));
       } else if (HOST !== "127.0.0.1") {
@@ -674,7 +698,10 @@ const server = http.createServer((req, res) => {
       req.on("end", () => {
         try {
           const j = JSON.parse(body);
-          const num = (v) => (v === null || (typeof v === "number" && Number.isFinite(v) && v >= 0) ? v : undefined);
+          // caps/thresholds must be POSITIVE or null(=disabled). Reject 0 — every rule gates on `limit>0`,
+          // so a 0 cap silently DISABLES the guard (false green) instead of tightening it. null is the
+          // only intended "disabled" value; use a real positive number to actually cap.
+          const num = (v) => (v === null || (typeof v === "number" && Number.isFinite(v) && v > 0) ? v : undefined);
           const patch = {};
           if (num(j.globalOutflowUsdPerHour) !== undefined) patch.globalOutflowUsdPerHour = j.globalOutflowUsdPerHour;
           if (typeof j.warnFraction === "number" && j.warnFraction > 0 && j.warnFraction <= 1) patch.warnFraction = j.warnFraction;
