@@ -770,10 +770,13 @@ async function checkProbeCluster(ev) {
 // Flash's authorized responder. Latched (contains once per wallet). Gated by CONTAINMENT=1.
 let containBusy = false;
 async function runContainment(ev) {
-  if (!containment.CONTAINMENT() || containBusy) return;
+  // The airtight lifetime-proof runs whenever the operator wants security alerts OR has armed auto-containment.
+  // Detection (the proven alarm) is decoupled from the auto-response so the strongest signal is never off by default.
+  if ((!SECURITY_ALERTS() && !containment.CONTAINMENT()) || containBusy) return;
   const c = containment.cfg();
   const cands = containment.selectCandidates(ev, c);
   if (!cands.length) return;
+  cands.sort((a, b) => (b.out1hUsd || 0) - (a.out1hUsd || 0) || (b.out24hUsd || 0) - (a.out24hUsd || 0)); // prove the biggest/most-live withdrawals first
   containBusy = true;
   try {
     const flashVaults = new Set(Object.keys(S.balances || {})); // vault token accounts — counterparty check for the proof
@@ -808,13 +811,15 @@ async function runContainment(ev) {
         }
         continue;
       }
-      // PROVEN DRAIN → CONTAIN (latch, alarm, signal)
-      S.containment.trips[w] = { wallet: w, lifetimeOut: proof.lifetimeOut, lifetimeIn: proof.lifetimeIn, ratio: proof.ratio === Infinity ? null : proof.ratio, txCount: proof.txCount, sigs: proof.sigs, at: now(), mode: containment.MODE() };
+      // PROVEN OVER-WITHDRAWAL (airtight, full lifetime history) → ALWAYS alarm the operator. If auto-containment
+      // is armed (CONTAINMENT=1), ALSO fire the signed pause-request to Flash's responder.
+      const contained = containment.CONTAINMENT();
+      S.containment.trips[w] = { wallet: w, lifetimeOut: proof.lifetimeOut, lifetimeIn: proof.lifetimeIn, ratio: proof.ratio === Infinity ? null : proof.ratio, txCount: proof.txCount, sigs: proof.sigs, mint, markUsd, contained, at: now() };
       S.containment.lastTrip = now();
       saveState();
-      log(`🚨🚨 CONTAINMENT TRIPPED: ${w} — proven over-withdrawal $${Math.round(proof.lifetimeOut)} out vs $${Math.round(proof.lifetimeIn)} in (${proof.txCount}-tx full history)`);
-      sendSecurityAlert(containment.buildAlarmText(proof, c)); // max-priority DM (containment is its own gate; fires even if SECURITY_ALERTS/mute are off)
-      if (c.webhook && isPublicHttpUrl(c.webhook)) {
+      log(`🚨🚨 PROVEN OVER-WITHDRAWAL: ${w} — $${Math.round(proof.lifetimeOut)} out vs $${Math.round(proof.lifetimeIn)} in (${proof.txCount}-tx full history)${contained ? " — CONTAINING" : ""}`);
+      sendSecurityAlert(containment.buildAlarmText(proof, c, contained)); // proven → always DM (its own gate; fires even if mute is on)
+      if (contained && c.webhook && isPublicHttpUrl(c.webhook)) {
         fetch(c.webhook, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(containment.buildPayload(proof, c)), signal: AbortSignal.timeout(8000) })
           .then((r) => log(`containment signal POSTed to responder → ${r && r.ok ? "accepted" : "non-200"}`))
           .catch((e) => log(`containment webhook failed: ${e.message}`));
@@ -1063,7 +1068,7 @@ function snapshot() {
     // A NEW phantom is the 7-day-rehearsal fingerprint (over-withdrawal path being exercised) — alerted privately.
     reconciliation: S.reconStatus ? { ...S.reconStatus, openPhantoms: Object.values(S.reconKnown).map((m) => ({ market: m.market, side: m.side, pool: m.pool, posDiff: m.posDiff, firstSeen: m.firstSeen })) } : null,
     // Layer 3 auto-containment posture + any proven-drain trips (proof-gated; sentinel holds no pause key by design).
-    containment: { ...containment.posture(containment.cfg()), lastTrip: S.containment.lastTrip, trips: Object.values(S.containment.trips).slice(-10).reverse() },
+    containment: { ...containment.posture(containment.cfg(), SECURITY_ALERTS()), lastTrip: S.containment.lastTrip, trips: Object.values(S.containment.trips).slice(-10).reverse() },
     governance: S.governance ? { ...S.governance, changes: S.govChanges.slice(-40).reverse(), authorizedUpgrades: S.authorizedUpgrades.slice(-20).reverse() } : null,
     alerts: redactWatchedAlerts(S.alertsActive, S.alertsLog.slice(-100).reverse()),
     events: S.events.slice(-250).reverse().map((e) => ({ ...e, kind: classify(e.ix || [], e.direction), internal: !!(S.authority && e.wallet === S.authority) })),

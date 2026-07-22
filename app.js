@@ -270,9 +270,9 @@ function renderLayers(S) {
   // Layer 3 — auto-containment (real posture)
   const cm = S.containment || {}; const contTrips = (cm.trips || []).length;
   const l3 = [
-    li(cm.enabled ? "ok" : "idle", "proof", "Proof engine (full-history)", cm.enabled ? "armed ⚡" : "standby"),
+    li(cm.proofAlarmActive ? "ok" : "idle", "proof", "Proven over-withdrawal alarm", cm.proofAlarmActive ? "always-on ⚡" : "off"),
+    li(cm.enabled ? "ok" : "idle", "", "Auto-response (contain)", cm.enabled ? "armed" : "off"),
     li("ok", "", "Pause key held", "none — signal only"),
-    li(cm.webhookConfigured ? "ok" : "idle", "", "Responder webhook", cm.webhookConfigured ? (cm.responder || "configured") : "awaiting webhook"),
   ];
 
   el.innerHTML = [
@@ -280,8 +280,8 @@ function renderLayers(S) {
       "Two of these are <em>proofs</em> — a freshly-deployed program and a coordinated probe-cluster are verified on-chain before they fire. Over-withdrawal is a fast <em>risk-limit</em> heads-up; its airtight on-chain proof lives in Layer 3.", l1),
     layer(2, "l2", "Continuous integrity", badge(l2bad ? "bad" : l2warn ? "warn" : "ok", l2bad ? "BREACH" : l2warn ? "SYNCING" : "ALL EXACT"),
       "Proves the vaults' integrity every cycle — outflow velocity vs cap, true (net) drawdown, raw-u64 conservation, an independent Pyth Lazer oracle cross-check, governance/authority, and phantom-position reconciliation.", l2),
-    layer(3, "l3", "Auto-containment · DRAIN DEFENSE", badge(contTrips ? "bad" : cm.enabled ? "ok" : "idle", contTrips ? contTrips + " CONTAINED" : cm.enabled ? "ARMED ⚡" : "STANDBY"),
-      "A drain proven on-chain (a wallet's full history shows it withdrew more than it deposited) instantly fires a max-priority alert + a signed pause-request to Flash's own responder. Signal, not authority — the monitor holds no pause key.", l3),
+    layer(3, "l3", "DRAIN DEFENSE · proven over-withdrawal", badge(contTrips ? "bad" : cm.enabled ? "ok" : cm.proofAlarmActive ? "ok" : "idle", contTrips ? contTrips + " PROVEN" : cm.enabled ? "ARMED ⚡" : cm.proofAlarmActive ? "ALARM ON ⚡" : "STANDBY"),
+      "The airtight one: it verifies a wallet's ENTIRE on-chain history and fires only when it PROVABLY withdrew more than it ever deposited — catching slow drips, stale deposits and split wallets that dodge the velocity limits. Always-on proven alarm; optional auto-signal to Flash's responder. Signal, not authority — the monitor holds no pause key.", l3),
   ].join("");
 
   if (tag) {
