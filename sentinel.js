@@ -27,7 +27,7 @@ const { fetchLazerMeta, fetchLazerLatest } = require("./lib/lazer.cjs");
 const { fetchFlashLazerPrices, fetchFlashLazerIds } = require("./lib/flashprices.cjs");
 const { DEFAULT_LIMITS, evaluate, ruleStates, hourlyBucketsBySide } = require("./lib/limits.cjs");
 const { fetchGovernance, diffGovernance, mergeGovernance } = require("./lib/authority.cjs");
-const { deliverAlert, heartbeat, sendTelegram, sendOperator, sendSecurityAlert, sendWithdrawalNotice, channelsConfigured } = require("./lib/notify.cjs");
+const { deliverAlert, heartbeat, sendTelegram, sendOperator, sendSecurityAlert, sendWithdrawalNotice, sendOrEditLiveStatus, channelsConfigured } = require("./lib/notify.cjs");
 const containment = require("./lib/containment.cjs"); // Layer 3 — proof-gated auto-containment
 const reconwatch = require("./lib/reconwatch.cjs");
 
@@ -89,6 +89,8 @@ const S = {
   probeFunders: {},          // probe wallet → funding source (in-memory cache; re-traced on restart, only runs when a cluster exists)
   probeClusterKey: null,     // latch: last-alerted coordinated-cluster signature (funder:count) so a proven cluster alarms once
   containment: { trips: {}, lastTrip: null, checked: {} }, // Layer 3: proven-drain trips (persisted) + in-memory verify cache
+  liveStatusMsgId: null,     // Telegram message_id of the live-status message (edited in place every minute; persisted so restarts reuse it, no dupes)
+  liveStatusLast: 0,         // last live-status edit time (in-memory)
   lastDigestUnix: 0,         // last daily-digest broadcast (persisted; survives restarts)
   lastWeeklyUnix: 0,         // last weekly deep-dive broadcast (persisted)
   pyth: { feeds: {}, prices: {}, source: "flash-api" },
@@ -132,13 +134,14 @@ function loadState() {
     S.progSeeded = !!j.progSeeded;
     S.probeClusterKey = j.probeClusterKey || null;
     S.containment = { trips: (j.containment && j.containment.trips) || {}, lastTrip: (j.containment && j.containment.lastTrip) || null, checked: {} };
+    S.liveStatusMsgId = j.liveStatusMsgId || null;
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
+  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
   // ATOMIC write: a crash mid-write must never leave a half-written state file (which would wipe the sent-
   // history on reboot and re-send withdrawals). Write to a temp file, then rename — rename is atomic on the
   // volume's filesystem, so readers only ever see a complete file.
@@ -250,6 +253,62 @@ function composeDigest() {
   L.push(``);
   L.push(`🔗 flash-flow-sentinel.vercel.app`);
   return L.join("\n");
+}
+// ---------------- live status — ONE private-DM message, edited in place every minute (no spam) ----------------
+const LIVE_STATUS = () => process.env.LIVE_STATUS === "1";
+const LIVE_STATUS_SEC = Number(process.env.LIVE_STATUS_SEC || 60);
+let liveStatusBusy = false;
+function buildLiveStatus() {
+  const ev = S.lastEval; if (!ev || !ev.global) return null;
+  const g = ev.global;
+  const rows = conservationRows(); const cn = rows.length, cx = rows.filter((r) => r.status === "exact").length;
+  const consOk = cn > 0 && cx === cn;
+  const sv = S.reconStatus && S.reconStatus.solvency;
+  const svOk = !!(sv && sv.present && sv.allHold && !sv.stale);
+  const phantom = (S.reconStatus && S.reconStatus.mismatched) || 0;
+  const govN = (S.govChanges || []).length;
+  const contTrips = Object.keys(S.containment.trips || {}).length;
+  const tvl = (ev.tokens || []).reduce((s, t) => s + (t.vaultUsd || 0), 0);
+  const oi = (S.markets || []).reduce((s, m) => s + (m.oiUsd || 0), 0);
+  const out24 = (ev.tokens || []).reduce((s, t) => s + (t.out24hUsd || 0), 0);
+  const wallets1h = (ev.wallets || []).filter((w) => (w.out1hUsd || 0) > 0).length;
+  const stale = S.lastCycle ? now() - S.lastCycle : null;
+  const allGreen = consOk && svOk && g.status === "ok" && !phantom && !govN && !contTrips;
+  const L = (ok, label, val) => `${ok ? "✅" : "🔴"} ${label}: ${val}`;
+  const usd = (n) => "$" + Math.round(n || 0).toLocaleString("en-US");
+  const hhmmss = new Date(now() * 1000).toISOString().slice(11, 19);
+  return [
+    `${allGreen ? "🟢" : "🔴"} FLASH V2 · FLOW SENTINEL — LIVE`,
+    `━━━━━━━━━━━━━━━━━━━━`,
+    `updated ${hhmmss} UTC · cycle #${S.cycles} · ${stale != null ? stale + "s ago" : "—"}`,
+    ``,
+    `PROVEN GUARDS (verified on-chain)`,
+    L(consOk, "Conservation (u64)", `${cx}/${cn} exact`),
+    L(svOk, "Solvency (census)", sv ? (sv.stale ? "stale" : (sv.allHold ? `all hold · deficit ${sv.deficit || 0}` : `${(sv.fails || []).length} FAILED`)) : "syncing"),
+    L(!phantom, "Phantom positions", `${phantom} open`),
+    L(!govN, "Governance / authority", govN ? `${govN} change` : "stable"),
+    L(!contTrips, "Over-withdrawal", contTrips ? `${contTrips} PROVEN` : "none proven"),
+    ``,
+    `FLOW (real on-chain)`,
+    `Out 1h ${usd(g.out1hUsd)} · In 1h ${usd(g.in1hUsd)} · Net ${usd((g.in1hUsd || 0) - (g.out1hUsd || 0))}`,
+    `Out 24h ${usd(out24)} · TVL $${(tvl / 1e6).toFixed(2)}M · OI $${(oi / 1e6).toFixed(2)}M`,
+    `Withdrawing wallets (1h): ${wallets1h}`,
+    ``,
+    `cycle ${S.cycleSeconds}s · ${wsUp ? "WS push ⚡" : "poll"} · wedges ${cycleWedges} · alarms → this DM (proven-only)`,
+    `🔗 flash-flow-sentinel.vercel.app`,
+  ].join("\n");
+}
+async function maybeSendLiveStatus() {
+  if (!LIVE_STATUS() || liveStatusBusy) return;
+  if (S.liveStatusLast && now() - S.liveStatusLast < LIVE_STATUS_SEC) return;
+  liveStatusBusy = true;
+  try {
+    const text = buildLiveStatus(); if (!text) return;
+    const id = await sendOrEditLiveStatus(text, S.liveStatusMsgId);
+    if (id && id !== S.liveStatusMsgId) { S.liveStatusMsgId = id; saveState(); } // persist only on a NEW message (first post / repost)
+    S.liveStatusLast = now();
+  } catch (e) { S.cycleErrors.push("livestatus: " + (e.message || e)); }
+  finally { liveStatusBusy = false; }
 }
 function maybeSendDigest() {
   if (!S.lastEval) return; // wait until we have a real evaluation
@@ -985,6 +1044,7 @@ async function cycle(reason) {
     heartbeat(); // dead-man ping — external monitor alerts if the sentinel goes silent
     maybeSendDigest(); // daily status broadcast to the channel
     maybeSendWeekly(); // weekly deep-dive broadcast
+    maybeSendLiveStatus(); // live status → operator DM, edited in place every minute (no spam)
     if (freshCount) log(`cycle #${S.cycles}${reason ? ` (${reason})` : ""}: +${freshCount} events, ${S.cycleSeconds}s, global out1h $${ev.global.out1hUsd} [${ev.global.status}]`);
     broadcast();
   } catch (e) {
