@@ -565,7 +565,7 @@ const RECON_CHECK_MS = Number(process.env.RECON_CHECK_MS || 180000); // basket-v
 // A cycle normally takes ~15s; even a 429-storm with RPC retries stays well under this. If `busy` is still
 // held past this ceiling, the cycle is wedged on an await that will never return (a monitor must NEVER be
 // able to stall permanently) — the watchdog force-releases the lock so the next poll tick runs a fresh cycle.
-const CYCLE_MAX_MS = Number(process.env.CYCLE_MAX_MS || 120000);
+const CYCLE_MAX_MS = Number(process.env.CYCLE_MAX_MS || 300000);
 const WATCHDOG_TICK_MS = Number(process.env.WATCHDOG_TICK_MS || 15000);
 async function cycle(reason) {
   if (busy) return;
@@ -688,7 +688,10 @@ function snapshot() {
       startedAt: S.startedAt, lastCycle: S.lastCycle, cycleSeconds: S.cycleSeconds, pollMs: POLL_MS, cycles: S.cycles, wsPush: wsUp, cycleWedges,
       // freshness/coverage the client uses to gate the verdict: serverNow−lastCycle = true staleness even
       // if the cycle loop wedges (the HTTP server keeps serving), backfilling until first full scan done.
-      serverNow: now(), ready: S.ready, backfilling: !S.ready, staleCutoffSec: Math.max(90, Math.round(POLL_MS / 1000) * 5),
+      // Stale cutoff adapts to how long a cycle actually takes on the current RPC (a full poll of 52 vaults
+      // on a slow/public RPC legitimately runs ~100s) so a healthy-but-slow cycle isn't falsely flagged
+      // stale; bounded 180–600s. A genuine hang is caught separately by the watchdog (CYCLE_MAX_MS).
+      serverNow: now(), ready: S.ready, backfilling: !S.ready, staleCutoffSec: Math.min(600, Math.max(180, Math.round((S.cycleSeconds || 0) * 2))),
       oracleFeedCount: Object.keys(S.pyth.prices || {}).length, // 0 ⇒ independent cross-check is down (not "aligned")
       coverageDegraded: S.coverageDegraded || null,
       backfillHours: BACKFILL_HOURS, retentionHours: RETENTION_HOURS, eventsRetained: S.events.length,
