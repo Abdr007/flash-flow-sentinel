@@ -610,13 +610,17 @@ function notifyWithdrawals() {
   })();
 }
 
-// ---------------- new-program detector (earliest exploit-rehearsal footprint) ----------------
-// The attacker's very first move was deploying a custom program and pointing it at Flash. This flags the
-// moment a program NEVER seen touching Flash vaults before starts appearing in vault transactions. The
-// existing program set is baselined once (seed) so routine infra (Token/System/Flash/Squads/MagicBlock/
-// integrations) never alerts; only a genuinely new program does — one alert per program. Security DM only.
-function checkNewPrograms() {
-  if (!SECURITY_ALERTS()) return;
+// ---------------- new-program detector (PROVEN-ONLY: fresh-deploy footprint) ----------------
+// The attacker's earliest move was DEPLOYING a custom program and pointing it at Flash. A program merely
+// "not seen before" is NOT proof of anything — core infra (ATA, session-keys) appears sporadically and is
+// years/months old. So before ever alarming, this VERIFIES the program's on-chain deploy age: it alarms only
+// on an UPGRADEABLE program DEPLOYED WITHIN THE LAST ~30 DAYS (the real attacker signature — they deploy days
+// before a drain). Anything established, core/native, or unverifiable is baselined SILENTLY. Proof or silence.
+const UPGRADEABLE_LOADER = "BPFLoaderUpgradeab1e11111111111111111111111";
+const NEWPROG_RECENCY_DAYS = Number(process.env.NEWPROG_RECENCY_DAYS || 30);
+let newProgBusy = false;
+async function checkNewPrograms() {
+  if (!SECURITY_ALERTS() || newProgBusy) return;
   const t = now();
   const seen = new Set();
   for (const e of S.events) if (Array.isArray(e.programs)) for (const p of e.programs) seen.add(p);
@@ -624,19 +628,50 @@ function checkNewPrograms() {
   if (!S.progSeeded) {
     for (const p of seen) if (!S.knownPrograms[p]) S.knownPrograms[p] = t;
     S.progSeeded = true; saveState();
-    log(`NEW-PROGRAM detector seeded: ${Object.keys(S.knownPrograms).length} programs baselined (only new ones alert from here)`);
+    log(`NEW-PROGRAM detector seeded: ${Object.keys(S.knownPrograms).length} programs baselined`);
     return;
   }
   const fresh = [...seen].filter((p) => !S.knownPrograms[p]);
   if (!fresh.length) return;
-  for (const p of fresh) {
-    S.knownPrograms[p] = t;
-    const evs = S.events.filter((e) => Array.isArray(e.programs) && e.programs.includes(p));
-    const sample = evs[evs.length - 1];
-    log(`NEW PROGRAM touching Flash vaults: ${p} (${evs.length} tx)`);
-    sendSecurityAlert(`🟠  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nNEW PROGRAM TOUCHING FLASH\n\nA program never seen before is interacting with Flash vaults:\n${p}\n${sample ? `\ne.g. ${sample.pool}/${sample.symbol} · https://solscan.io/tx/${sample.sig}` : ""}\n\n⚠️ An unknown program touching vaults can be an early attack footprint (the attacker deployed one before the drain). Verify it's a known integration.`);
-  }
-  saveState();
+  newProgBusy = true;
+  try {
+    let curSlot = null;
+    try { const s = await main("getSlot", []); curSlot = s && s.result; } catch (e) {}
+    const bs58 = require("bs58");
+    for (const p of fresh) {
+      S.knownPrograms[p] = t; // baseline regardless — never re-verify the same program
+      if (p === PROG) continue; // never alarm on Flash's own program (it upgraded during remediation → looks "fresh")
+      let verdict = "established", ageDays = null;
+      try {
+        const inf = await main("getAccountInfo", [p, { encoding: "base64" }]);
+        const val = inf && inf.result && inf.result.value;
+        const owner = val && val.owner;
+        // Only an UPGRADEABLE program can be freshly deployed+controlled by an attacker. Core/native programs
+        // (ATA=BPFLoader2, System/ComputeBudget=NativeLoader) can never be — baseline them silently.
+        if (owner === UPGRADEABLE_LOADER && val.data && val.data[0] && curSlot) {
+          const buf = Buffer.from(val.data[0], "base64");
+          if (buf.length >= 36) {
+            const pd = bs58.encode(buf.slice(4, 36)); // ProgramData address
+            const pdInf = await main("getAccountInfo", [pd, { encoding: "base64" }]);
+            const pdVal = pdInf && pdInf.result && pdInf.result.value;
+            if (pdVal && pdVal.data && pdVal.data[0]) {
+              const deploySlot = Number(Buffer.from(pdVal.data[0], "base64").readBigUInt64LE(4));
+              ageDays = (curSlot - deploySlot) * 0.4 / 86400; // ~0.4s/slot
+              if (ageDays <= NEWPROG_RECENCY_DAYS) verdict = "fresh";
+            } else verdict = "unverified";
+          }
+        } // owner !== upgradeable loader → established core/native
+      } catch (e) { verdict = "unverified"; }
+      // PROVEN-ONLY: alarm ONLY when we can prove it's a freshly-deployed program. Established / core /
+      // unverifiable → baseline silently (never cry wolf without proof — per the operator directive).
+      if (verdict !== "fresh") { log(`new program ${p} — ${verdict}${ageDays != null ? ` (~${ageDays.toFixed(0)}d old)` : ""} — baselined silently, not an attack footprint`); continue; }
+      const evs = S.events.filter((e) => Array.isArray(e.programs) && e.programs.includes(p));
+      const sample = evs[evs.length - 1];
+      log(`🔴 FRESHLY-DEPLOYED program touching Flash: ${p} (~${ageDays.toFixed(0)}d old)`);
+      sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nFRESH PROGRAM TOUCHING FLASH\n\nA program deployed only ~${ageDays.toFixed(0)} days ago is interacting with Flash vaults:\n${p}\n${sample ? `\ne.g. ${sample.pool}/${sample.symbol} · https://solscan.io/tx/${sample.sig}` : ""}\n\n⚠️ PROVEN on-chain: a freshly-deployed program touching vaults is the exact attacker footprint (they deploy days before a drain). Investigate now.`);
+    }
+    saveState();
+  } finally { newProgBusy = false; }
 }
 
 // ---------------- realtime push: WebSocket accountSubscribe on every vault ----------------
