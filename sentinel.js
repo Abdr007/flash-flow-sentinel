@@ -77,7 +77,8 @@ const S = {
   reconStatus: null,         // last census reconciliation summary { mismatched, marketSides, allExact, checkedAt }
   governance: null,          // live governance snapshot (upgrade auth, multisig, permissions)
   govBaseline: null,         // last-good full governance snapshot for change detection (persisted)
-  govChanges: [],            // recorded governance changes (also alerts)
+  govChanges: [],            // recorded governance changes (also alerts) — drives the red governance verdict
+  authorizedUpgrades: [],    // program upgrades AUTO-VERIFIED as authorized (multisig, authority unchanged) — informational review-log, NOT red
   lastDigestUnix: 0,         // last daily-digest broadcast (persisted; survives restarts)
   lastWeeklyUnix: 0,         // last weekly deep-dive broadcast (persisted)
   pyth: { feeds: {}, prices: {}, source: "flash-api" },
@@ -112,13 +113,14 @@ function loadState() {
     S.conservation = j.conservation || {};   // persist the conservation baseline so a restart can't re-baseline away a pre-existing missed-transfer drift (false "exact")
     S.reconKnown = j.reconKnown || {};        // persist known phantom mismatches so a restart doesn't re-alert them
     S.reconSeeded = !!j.reconSeeded;
+    S.authorizedUpgrades = j.authorizedUpgrades || [];
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  fs.writeFileSync(F_STATE, JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2));
+  fs.writeFileSync(F_STATE, JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2));
 }
 function loadEvents() {
   const cutoff = now() - RETENTION_HOURS * 3600;
@@ -438,6 +440,17 @@ async function checkGovernance() {
   const changes = diffGovernance(prev, gov);
   if (!changes.length) { S.govBaseline = gov; return; }   // fingerprint moved only on a skipped section → no wolf
   for (const ch of changes) {
+    // An upgrade AUTO-VERIFIED as authorized (through the unchanged multisig authority) is not a red event:
+    // record it in the informational review-log so the human still sees it and reviews the new bytecode, but
+    // do NOT latch a critical or flip the governance verdict red — that would be crying wolf on a routine,
+    // authorized upgrade. Only genuinely unexpected changes (authority swap, control drop, unverified deploy)
+    // take the critical path below.
+    if (ch.authorized) {
+      const u = { time: t, rule: ch.key, severity: "notice", authorized: true, detail: ch.detail };
+      S.authorizedUpgrades.push(u); S.alertsLog.push({ ...u, from: "ok", to: "notice" }); appendAlert({ ...u, from: "ok", to: "notice" });
+      log(`GOVERNANCE authorized upgrade (verified) — ${ch.detail}`);
+      continue;
+    }
     const a = { time: t, rule: ch.key, from: "ok", to: "breach", severity: ch.severity, detail: ch.detail };
     S.govChanges.push(a); S.alertsActive[ch.key] = { status: "breach", severity: ch.severity, detail: ch.detail, since: t };
     S.alertsLog.push(a); appendAlert(a); fireWebhook(a);
@@ -717,7 +730,7 @@ function snapshot() {
     // reconciliation-anomaly watch: live basket-vs-market phantom-position count + the set currently open.
     // A NEW phantom is the 7-day-rehearsal fingerprint (over-withdrawal path being exercised) — alerted privately.
     reconciliation: S.reconStatus ? { ...S.reconStatus, openPhantoms: Object.values(S.reconKnown).map((m) => ({ market: m.market, side: m.side, pool: m.pool, posDiff: m.posDiff, firstSeen: m.firstSeen })) } : null,
-    governance: S.governance ? { ...S.governance, changes: S.govChanges.slice(-40).reverse() } : null,
+    governance: S.governance ? { ...S.governance, changes: S.govChanges.slice(-40).reverse(), authorizedUpgrades: S.authorizedUpgrades.slice(-20).reverse() } : null,
     alerts: redactWatchedAlerts(S.alertsActive, S.alertsLog.slice(-100).reverse()),
     events: S.events.slice(-250).reverse().map((e) => ({ ...e, kind: classify(e.ix || [], e.direction), internal: !!(S.authority && e.wallet === S.authority) })),
     failures1h: S.failures.filter((f) => f.blockTime >= now() - 3600).length,
