@@ -159,19 +159,23 @@ function fireWebhook(a, tokens) {
 function processAlertTransitions(ev) {
   const next = ruleStates(ev);
   const t = now();
+  // Oracle mark-vs-Lazer deviation is informational (not a vault-drain signal) and frequent — per the Flash
+  // team it must NOT be pushed to the main channel. We still record it on the dashboard + alert log; we just
+  // suppress the external notification for oracle:* rules.
+  const pushAlert = (a, tokens) => { if (!String(a.rule || "").startsWith("oracle:")) fireWebhook(a, tokens); };
   for (const [key, st] of Object.entries(next)) {
     const prev = S.alertsActive[key];
     if (!prev) {
       S.alertsActive[key] = { ...st, since: t };
       if (st.status !== "ok") { // never log/webhook a rule that starts green
         const a = { time: t, rule: key, from: "ok", to: st.status, detail: st.detail, severity: st.severity };
-        S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a }, ev.tokens);
+        S.alertsLog.push(a); appendAlert(a); pushAlert({ source: "flash-flow-sentinel", ...a }, ev.tokens);
         log(`ALERT ${(st.severity || st.status).toUpperCase()} ${key} — ${st.detail}`);
       }
     } else if (prev.status !== st.status) {
       const a = { time: t, rule: key, from: prev.status, to: st.status, detail: st.detail, severity: st.severity };
       S.alertsActive[key] = { ...st, since: prev.since };
-      S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a }, ev.tokens);
+      S.alertsLog.push(a); appendAlert(a); pushAlert({ source: "flash-flow-sentinel", ...a }, ev.tokens);
       log(`ALERT ${prev.status}→${st.status} ${key} — ${st.detail}`);
     } else {
       S.alertsActive[key].detail = st.detail; S.alertsActive[key].severity = st.severity; // keep severity fresh even when status is unchanged (e.g. a threat escalating within "breach")
@@ -182,7 +186,7 @@ function processAlertTransitions(ev) {
     if (!next[key]) {
       const a = { time: t, rule: key, from: S.alertsActive[key].status, to: "ok", detail: "resolved" };
       delete S.alertsActive[key];
-      S.alertsLog.push(a); appendAlert(a); fireWebhook(a);
+      S.alertsLog.push(a); appendAlert(a); pushAlert(a);
       log(`ALERT resolved ${key}`);
     }
   }
