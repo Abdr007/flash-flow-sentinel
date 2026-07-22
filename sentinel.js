@@ -450,8 +450,14 @@ async function checkGovernance() {
 // Alerts route to the OPERATOR DM ONLY (private) — never the public channel — until explicitly promoted.
 async function checkReconciliation() {
   let recon;
-  try { recon = await reconwatch.fetchReconciliation(); }
-  catch (e) { S.cycleErrors.push("recon: " + e.message); return; }
+  try {
+    // Hard ceiling independent of fetch's own AbortSignal, so a stalled census body-read can never hold the
+    // cycle. If it loses the race the reject is caught below and the cycle proceeds untouched.
+    recon = await Promise.race([
+      reconwatch.fetchReconciliation(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("recon timeout (30s)")), 30000)),
+    ]);
+  } catch (e) { S.cycleErrors.push("recon: " + e.message); return; }
   const t = now();
   S.reconStatus = { mismatched: recon.mismatchedCount, marketSides: recon.marketSides, allExact: recon.allExact, checkedAt: t };
 
@@ -553,11 +559,19 @@ async function refreshIndependentPrices() {
 }
 
 let lastCustodyRefresh = 0, busy = false, lastGovCheck = 0, lastReconCheck = 0;
+let cycleStartedAt = 0, cycleGen = 0, cycleWedges = 0; // watchdog: detect + force-recover a hung cycle
 const GOV_CHECK_MS = Number(process.env.GOV_CHECK_MS || 120000); // governance rarely changes; 5 RPCs
 const RECON_CHECK_MS = Number(process.env.RECON_CHECK_MS || 180000); // basket-vs-market reconciliation (1 census fetch)
+// A cycle normally takes ~15s; even a 429-storm with RPC retries stays well under this. If `busy` is still
+// held past this ceiling, the cycle is wedged on an await that will never return (a monitor must NEVER be
+// able to stall permanently) — the watchdog force-releases the lock so the next poll tick runs a fresh cycle.
+const CYCLE_MAX_MS = Number(process.env.CYCLE_MAX_MS || 120000);
+const WATCHDOG_TICK_MS = Number(process.env.WATCHDOG_TICK_MS || 15000);
 async function cycle(reason) {
   if (busy) return;
   busy = true;
+  const myGen = ++cycleGen;   // if the watchdog force-restarts, a newer cycle supersedes this one
+  cycleStartedAt = Date.now();
   const t0 = Date.now();
   S.cycleErrors = [];
   try {
@@ -598,7 +612,10 @@ async function cycle(reason) {
     S.cycleErrors.push("cycle: " + (e.message || e));
     log("CYCLE ERROR:", e.message || e);
   } finally {
-    busy = false;
+    // Only release the lock if we're still the current generation. If the watchdog already force-restarted
+    // (this cycle was wedged and a newer cycle now owns `busy`), a late-resolving zombie must NOT clear the
+    // newer cycle's lock — otherwise two cycles could run concurrently.
+    if (cycleGen === myGen) busy = false;
   }
 }
 
@@ -668,7 +685,7 @@ function snapshot() {
       name: "FLASH FLOW SENTINEL", program: PROG, cluster: "mainnet", erRpc: redact(ER_URL), mainRpc: redact(MAIN_URL),
       erSlot: S.erSlot, custodies: S.custodies.length, realVaults: realC().length, trackedVaults: tracked().length, markets: S.markets.length, pools: S.pools,
       sweep: { authority: S.authority, watched: Object.keys(S.sweepBal).length, promoted: Object.keys(S.dynamic).length, namedVaults: S.named.map((n) => `${n.pool}/${n.symbol}`) },
-      startedAt: S.startedAt, lastCycle: S.lastCycle, cycleSeconds: S.cycleSeconds, pollMs: POLL_MS, cycles: S.cycles, wsPush: wsUp,
+      startedAt: S.startedAt, lastCycle: S.lastCycle, cycleSeconds: S.cycleSeconds, pollMs: POLL_MS, cycles: S.cycles, wsPush: wsUp, cycleWedges,
       // freshness/coverage the client uses to gate the verdict: serverNow−lastCycle = true staleness even
       // if the cycle loop wedges (the HTTP server keeps serving), backfilling until first full scan done.
       serverNow: now(), ready: S.ready, backfilling: !S.ready, staleCutoffSec: Math.max(90, Math.round(POLL_MS / 1000) * 5),
@@ -895,6 +912,24 @@ const server = http.createServer((req, res) => {
 
   connectWs();
   setInterval(() => cycle("poll"), POLL_MS);
+  // WATCHDOG — the guarantee that the monitor can never stall permanently. Runs on its own timer (the event
+  // loop stays alive even while a cycle's await is hung — the HTTP server keeps serving), so it can always
+  // fire. If a cycle has held `busy` past the ceiling, it's wedged on an await that will never return: log
+  // loudly, notify the operator, and force-release the lock (bumping the generation so the zombie can't
+  // clobber the fresh cycle). The next poll tick then runs a clean cycle within POLL_MS.
+  setInterval(() => {
+    if (!busy || !cycleStartedAt) return;
+    const stuckMs = Date.now() - cycleStartedAt;
+    if (stuckMs <= CYCLE_MAX_MS) return;
+    cycleWedges++;
+    const stuckS = Math.round(stuckMs / 1000);
+    cycleGen++;      // supersede the wedged cycle → its finally won't release the next cycle's lock
+    busy = false;    // release so the next poll tick starts fresh
+    cycleStartedAt = 0;
+    log(`WATCHDOG: cycle wedged ${stuckS}s on a hung await — force-released the lock; monitoring resuming (wedge #${cycleWedges})`);
+    try { S.cycleErrors.unshift(`watchdog: force-reset a cycle wedged ${stuckS}s`); } catch (e) {}
+    sendOperator(`⚠️ FLASH FLOW SENTINEL — watchdog recovered a wedged monitor cycle (hung ${stuckS}s on a network call, likely RPC). Lock force-released; monitoring is resuming automatically. Wedge #${cycleWedges}. Dashboard: flash-flow-sentinel.vercel.app`);
+  }, WATCHDOG_TICK_MS);
 })().catch((e) => { console.error("FATAL:", e); process.exit(1); });
 
 process.on("SIGINT", () => { try { saveState(); } catch (e) {} process.exit(0); });
