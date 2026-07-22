@@ -235,7 +235,7 @@ function renderLayers(S) {
   const ev = S.evaluation; const tag = $("layersTag");
   if (!ev) { el.innerHTML = ""; if (tag) tag.textContent = "—"; return; }
   const fs = freshnessState(S.meta);
-  const li = (state, name, val) => `<div class="layer-item ${state}"><span class="li-dot"></span><span class="li-name">${name}</span>${val ? `<span class="li-val">${esc(String(val))}</span>` : ""}</div>`;
+  const li = (state, kind, name, val) => `<div class="layer-item ${state}"><span class="li-dot"></span><span class="li-name">${name}</span>${val ? `<span class="li-val">${esc(String(val))}</span>` : ""}${kind ? `<span class="li-tag ${kind}" title="${kind === "proof" ? "PROOF — verified on-chain before it fires; cannot false-alarm on an exploit judgement" : "RISK LIMIT — fires when a configured threshold is crossed, even if the activity turns out legitimate; a heads-up, not a proof"}">${kind === "proof" ? "PROOF" : "RISK LIMIT"}</span>` : ""}</div>`;
   const badge = (cls, txt) => `<span class="layer-badge ${cls}">${txt}</span>`;
   const layer = (n, cls, name, badgeHtml, desc, items) => `<div class="layer ${cls}"><div class="layer-head"><div class="layer-title"><span class="layer-num">LAYER ${n}</span><span class="layer-name">${name}</span></div>${badgeHtml}</div><div class="layer-desc">${desc}</div><div class="layer-items">${items.join("")}</div></div>`;
   const g = ev.global;
@@ -245,9 +245,9 @@ function renderLayers(S) {
   const probes = (ev.probes || []).length;
   const l1bad = entBad > 0;
   const l1 = [
-    li(entBad ? "bad" : "ok", "Over-withdrawal (entitlement)", entBad ? entBad + " flagged" : "clear"),
-    li("ok", "Fresh-program deploy-age", "armed · verified on-chain"),
-    li("ok", "Coordinated probe-cluster", probes ? probes + " seen · 0 coordinated" : "clear"),
+    li(entBad ? "bad" : "ok", "risk", "Over-withdrawal (entitlement)", entBad ? entBad + " flagged" : "clear"),
+    li("ok", "proof", "Fresh-program deploy-age", "armed · verified on-chain"),
+    li("ok", "proof", "Coordinated probe-cluster", probes ? probes + " seen · 0 coordinated" : "clear"),
   ];
 
   // Layer 2 — continuous integrity
@@ -259,25 +259,25 @@ function renderLayers(S) {
   const l2bad = tokBad || oraBad || govBad || phantom || g.status === "breach";
   const l2warn = !consOk || oraDown || g.status === "warn";
   const l2 = [
-    li(g.status === "breach" ? "bad" : g.status === "warn" ? "warn" : "ok", "Outflow velocity", (g.utilization != null ? Math.round(g.utilization * 100) : 0) + "% of cap"),
-    li(tokBad ? "bad" : "ok", "Net-drawdown / token caps", tokBad ? tokBad + " breach" : ev.tokens.length + " ok"),
-    li(consOk ? "ok" : "warn", "Conservation (raw u64)", cn ? cx + "/" + cn + (consOk ? " exact" : " syncing") : "—"),
-    li(oraBad ? "bad" : oraDown ? "warn" : "ok", "Oracle cross-check (Lazer)", oraDown ? "feed down" : (S.meta.oracleFeedCount || 0) + " feeds · " + oraBad + " dev"),
-    li(govBad ? "bad" : "ok", "Governance / authority", govBad ? govBad + " change" : "stable"),
-    li(phantom ? "bad" : "ok", "Phantom-position recon", phantom ? phantom + " open" : "0 phantoms"),
+    li(g.status === "breach" ? "bad" : g.status === "warn" ? "warn" : "ok", "risk", "Outflow velocity", (g.utilization != null ? Math.round(g.utilization * 100) : 0) + "% of cap"),
+    li(tokBad ? "bad" : "ok", "risk", "Net-drawdown / token caps", tokBad ? tokBad + " breach" : ev.tokens.length + " ok"),
+    li(consOk ? "ok" : "warn", "proof", "Conservation (raw u64)", cn ? cx + "/" + cn + (consOk ? " exact" : " syncing") : "—"),
+    li(oraBad ? "bad" : oraDown ? "warn" : "ok", "risk", "Oracle cross-check (Lazer)", oraDown ? "feed down" : (S.meta.oracleFeedCount || 0) + " feeds · " + oraBad + " dev"),
+    li(govBad ? "bad" : "ok", "proof", "Governance / authority", govBad ? govBad + " change" : "stable"),
+    li(phantom ? "bad" : "ok", "proof", "Phantom-position recon", phantom ? phantom + " open" : "0 phantoms"),
   ];
 
   // Layer 3 — auto-containment (real posture)
   const cm = S.containment || {}; const contTrips = (cm.trips || []).length;
   const l3 = [
-    li(cm.enabled ? "ok" : "idle", "Proof engine", cm.enabled ? "armed ⚡" : "standby"),
-    li("ok", "Pause key held", "none — signal only"),
-    li(cm.webhookConfigured ? "ok" : "idle", "Responder webhook", cm.webhookConfigured ? (cm.responder || "configured") : "awaiting webhook"),
+    li(cm.enabled ? "ok" : "idle", "proof", "Proof engine (full-history)", cm.enabled ? "armed ⚡" : "standby"),
+    li("ok", "", "Pause key held", "none — signal only"),
+    li(cm.webhookConfigured ? "ok" : "idle", "", "Responder webhook", cm.webhookConfigured ? (cm.responder || "configured") : "awaiting webhook"),
   ];
 
   el.innerHTML = [
-    layer(1, "l1", "Proven-only detection", badge(l1bad ? "bad" : "ok", l1bad ? "THREAT" : "WATCHING"),
-      "Verifies every threat <em>on-chain</em> before it alarms — an over-withdrawal against real deposits, a freshly-deployed program touching the vaults, or coordinated probe wallets. No threshold guesses.", l1),
+    layer(1, "l1", "Attack detection", badge(l1bad ? "bad" : "ok", l1bad ? "THREAT" : "WATCHING"),
+      "Two of these are <em>proofs</em> — a freshly-deployed program and a coordinated probe-cluster are verified on-chain before they fire. Over-withdrawal is a fast <em>risk-limit</em> heads-up; its airtight on-chain proof lives in Layer 3.", l1),
     layer(2, "l2", "Continuous integrity", badge(l2bad ? "bad" : l2warn ? "warn" : "ok", l2bad ? "BREACH" : l2warn ? "SYNCING" : "ALL EXACT"),
       "Proves the vaults' integrity every cycle — outflow velocity vs cap, true (net) drawdown, raw-u64 conservation, an independent Pyth Lazer oracle cross-check, governance/authority, and phantom-position reconciliation.", l2),
     layer(3, "l3", "Auto-containment · DRAIN DEFENSE", badge(contTrips ? "bad" : cm.enabled ? "ok" : "idle", contTrips ? contTrips + " CONTAINED" : cm.enabled ? "ARMED ⚡" : "STANDBY"),
