@@ -118,13 +118,19 @@ function loadState() {
     S.authorizedUpgrades = j.authorizedUpgrades || [];
     S.wAlertFrom = j.wAlertFrom || 0;
     S.wAlertSent = j.wAlertSent || [];
+    S.wFreshToken = j.wFreshToken || null;
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  fs.writeFileSync(F_STATE, JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-800), lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2));
+  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
+  // ATOMIC write: a crash mid-write must never leave a half-written state file (which would wipe the sent-
+  // history on reboot and re-send withdrawals). Write to a temp file, then rename — rename is atomic on the
+  // volume's filesystem, so readers only ever see a complete file.
+  try { fs.writeFileSync(F_STATE + ".tmp", data); fs.renameSync(F_STATE + ".tmp", F_STATE); }
+  catch (e) { try { fs.writeFileSync(F_STATE, data); } catch (e2) {} } // fall back to direct write on any rename issue
 }
 function loadEvents() {
   const cutoff = now() - RETENTION_HOURS * 3600;
@@ -513,11 +519,24 @@ const wKey = (e) => `${e.sig}:${e.custody}`;
 let wSending = false; // one send-batch at a time so a burst is never double-sent across overlapping cycles
 function notifyWithdrawals() {
   if (!WITHDRAWAL_ALERTS() || wSending) return;
-  if (!S.wAlertFrom) { S.wAlertFrom = now(); log("withdrawal feed ENABLED — watermark set; notifying on all withdrawals from now (backlog not dumped)"); return; }
+  // One-time FRESH START: whenever WITHDRAWAL_FRESH_START changes value, reset the feed to *now* — clear the
+  // watermark to this instant and wipe the sent-history — so (re)enabling posts only brand-new transactions
+  // with zero backlog and zero chance of repeating anything sent before. Runs once per new token value.
+  const ft = process.env.WITHDRAWAL_FRESH_START;
+  if (ft && ft !== S.wFreshToken) { S.wFreshToken = ft; S.wAlertFrom = now(); S.wAlertSent = []; S._wSent = new Set(); saveState(); log(`withdrawal feed FRESH START (${ft}) — watermark reset to now, sent-history cleared: fresh txs only, no repeats`); return; }
+  if (!S.wAlertFrom) { S.wAlertFrom = now(); saveState(); log("withdrawal feed ENABLED — watermark set; notifying on all withdrawals from now (backlog not dumped)"); return; }
   const sent = S._wSent || (S._wSent = new Set(S.wAlertSent || []));
   const fresh = S.events.filter((e) => e.direction === "out" && e.sig && !(S.authority && e.wallet === S.authority) && e.blockTime >= S.wAlertFrom && !sent.has(wKey(e)));
   if (!fresh.length) return;
   fresh.sort((a, b) => a.blockTime - b.blockTime);
+  // ── DEDUP FIX (the duplicate flood): mark every fresh withdrawal as sent and PERSIST TO DISK *before* the
+  // Telegram send. Previously a tx was marked sent only AFTER delivery and persisted a cycle later, so any
+  // restart in that gap re-announced it — and I restarted many times. With the marker on disk first, a
+  // restart / redeploy can NEVER re-send a transaction. A delivery that then fails is logged loudly with its
+  // signature (failures are extremely rare on an admin channel + rate-limited spacing) — never silently re-sent.
+  for (const e of fresh) sent.add(wKey(e));
+  S.wAlertSent = [...sent].slice(-20000); // cap ≫ any 48h volume, so a key is never evicted then re-sent
+  saveState(); // persist the sent-markers NOW, before any Telegram call — this is what stops restart duplicates
   const short = (w) => (w ? w.slice(0, 6) + "…" + w.slice(-4) : "?");
   // Priced flows show USD; an unpriced one (LP-receipt token whose mark isn't resolved) shows the real token
   // amount instead of a bare "—", so no notice ever looks broken. All values are real on-chain.
@@ -525,9 +544,7 @@ function notifyWithdrawals() {
     ? "$" + Number(e.usd).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " " + e.symbol
     : Number(e.amount || 0).toLocaleString("en-US", { maximumFractionDigits: 4 }) + " " + e.symbol);
   // Report EVERY withdrawal — NOTHING truncated. Chunk into messages of 10 lines (safely under Telegram's
-  // 4096-char limit) and send them ALL. A chunk's withdrawals are marked sent ONLY after its message actually
-  // delivers, so a failed send is retried next cycle and no withdrawal is ever lost. Chunks are spaced to
-  // respect Telegram rate limits; wSending serializes batches so a burst is never double-sent.
+  // 4096-char limit) and send them ALL, spaced to respect rate limits; wSending serializes batches.
   const CHUNK = 10, total = fresh.length, chunks = [];
   for (let i = 0; i < total; i += CHUNK) chunks.push(fresh.slice(i, i + CHUNK));
   wSending = true;
@@ -540,12 +557,9 @@ function notifyWithdrawals() {
           : `💸 Flash V2 withdrawals (${c * CHUNK + 1}–${c * CHUNK + part.length} of ${total})`;
         const body = part.map((e) => `• ${amtStr(e)} (${e.pool}) → ${short(e.wallet)} · ${e.kind}\n  https://solscan.io/tx/${e.sig}`).join("\n");
         const ok = await sendWithdrawalNotice(`${hdr}\n\n${body}`);
-        if (ok) { for (const e of part) sent.add(wKey(e)); }
-        else { log(`withdrawal notice FAILED (${part.length} withdrawals) — retrying next cycle (none dropped)`); }
+        if (!ok) log(`WITHDRAWAL notice FAILED to deliver (${part.length}): ${part.map((e) => e.sig.slice(0, 10)).join(", ")} — already marked sent, will NOT re-send (resend manually if needed)`);
         if (c < chunks.length - 1) await new Promise((r) => setTimeout(r, 1100));
       }
-      S.wAlertSent = [...sent].slice(-6000);
-      S._wSent = new Set(S.wAlertSent);
     } finally { wSending = false; }
   })();
 }
