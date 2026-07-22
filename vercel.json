@@ -1,5 +1,5 @@
 {
   "rewrites": [
-    { "source": "/(.*)", "destination": "https://flash-flow-sentinel-production.up.railway.app/$1" }
+    { "source": "/(.*)", "destination": "https://flash-flow-sentinel.onrender.com/$1" }
   ]
 }

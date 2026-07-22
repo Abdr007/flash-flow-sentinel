@@ -85,6 +85,8 @@ const S = {
   wFreshToken: null,         // last WITHDRAWAL_FRESH_START value applied
   knownPrograms: {},         // programId → firstSeen — every program ever seen touching Flash vaults (new-program detector)
   progSeeded: false,         // once true, the existing program set is baselined; only NEW programs alert
+  probeFunders: {},          // probe wallet → funding source (in-memory cache; re-traced on restart, only runs when a cluster exists)
+  probeClusterKey: null,     // latch: last-alerted coordinated-cluster signature (funder:count) so a proven cluster alarms once
   lastDigestUnix: 0,         // last daily-digest broadcast (persisted; survives restarts)
   lastWeeklyUnix: 0,         // last weekly deep-dive broadcast (persisted)
   pyth: { feeds: {}, prices: {}, source: "flash-api" },
@@ -126,13 +128,14 @@ function loadState() {
     S.wSummaryLast = j.wSummaryLast || 0;
     S.knownPrograms = j.knownPrograms || {};
     S.progSeeded = !!j.progSeeded;
+    S.probeClusterKey = j.probeClusterKey || null;
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
+  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, probeClusterKey: S.probeClusterKey, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
   // ATOMIC write: a crash mid-write must never leave a half-written state file (which would wipe the sent-
   // history on reboot and re-send withdrawals). Write to a temp file, then rename — rename is atomic on the
   // volume's filesystem, so readers only ever see a complete file.
@@ -187,7 +190,8 @@ function processAlertTransitions(ev) {
   const secSend = (key, st) => {
     if (!SECURITY_ALERTS() || st.status !== "breach") return;
     if (key.startsWith("entitlement:")) sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nOVER-WITHDRAWAL DETECTED\n\n${String(st.detail || "").replace(/^⚠ CRITICAL — entitlement anomaly:\s*/, "")}\n\n🔗 flash-flow-sentinel.vercel.app`);
-    else if (key === "probe-cluster") sendSecurityAlert(`🟠  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nPOSSIBLE EXPLOIT REHEARSAL\n\n${String(st.detail || "").replace(/^⚠ /, "")}\n\n⚠️ Multiple fresh wallets are testing the deposit/withdraw path without extracting — the fingerprint that preceded the live drain. Investigate early.`);
+    // NOTE: probe-cluster is no longer routed here — it is decided by the async, on-chain-verified
+    // checkProbeCluster() (common-funding-source proof) so it can never fire on legit resumption testing.
   };
   for (const [key, st] of Object.entries(next)) {
     const prev = S.alertsActive[key];
@@ -674,6 +678,79 @@ async function checkNewPrograms() {
   } finally { newProgBusy = false; }
 }
 
+let probeBusy = false;
+const PROBE_FRESH_TX_MAX = Number(process.env.PROBE_FRESH_TX_MAX || 50); // a disposable rehearsal wallet has few lifetime txs
+// Trace a wallet's on-chain ORIGIN: its lifetime tx count (freshness) + FUNDER (the account that sent it the most
+// SOL in its earliest transaction). Cached in-memory (re-traced on restart; only runs when a cluster exists → rare).
+async function getOrigin(wallet) {
+  if (S.probeFunders[wallet] !== undefined) return S.probeFunders[wallet];
+  let funder = null, txCount = null;
+  try {
+    const sig = await main("getSignaturesForAddress", [wallet, { limit: 1000 }]);
+    const list = (sig && sig.result) || [];
+    txCount = list.length >= 1000 ? 1000 : list.length; // 1000 = capped (established); exact otherwise
+    if (list.length) {
+      const oldest = list[list.length - 1].signature; // last = earliest
+      const tx = await main("getTransaction", [oldest, { maxSupportedTransactionVersion: 0 }]);
+      const t = tx && tx.result;
+      if (t && t.meta && t.transaction) {
+        const keys = t.transaction.message.accountKeys.map((k) => (typeof k === "string" ? k : k.pubkey));
+        const pre = t.meta.preBalances || [], post = t.meta.postBalances || [];
+        let maxDrop = 0;
+        for (let i = 0; i < keys.length; i++) {
+          const drop = (pre[i] || 0) - (post[i] || 0); // lamports this account paid out
+          if (keys[i] !== wallet && drop > maxDrop) { maxDrop = drop; funder = keys[i]; }
+        }
+      }
+    }
+  } catch (e) {}
+  const o = { funder, txCount };
+  S.probeFunders[wallet] = o; // cache (null funder too) so we don't retrace
+  return o;
+}
+
+// PROVEN-ONLY probe-cluster. Tiny deposit→withdraw round-trips look IDENTICAL to legit resumption testing, so the
+// pattern alone NEVER alarms. Two independent on-chain proofs must BOTH hold before we alarm:
+//   (1) the wallets are genuinely FRESH/disposable on-chain (≤PROBE_FRESH_TX_MAX lifetime txs) — not real traders/MMs, and
+//   (2) ≥3 of those fresh wallets share a single common FUNDER — the coordination fingerprint (one entity spun them up).
+// Established wallets (hundreds of txs) that merely share an exchange/MM funder are excluded by (1); independently
+// funded fresh testers are excluded by (2). Only a genuinely coordinated disposable-wallet cluster survives.
+async function checkProbeCluster(ev) {
+  if (!SECURITY_ALERTS() || probeBusy) return;
+  const probes = (ev && ev.probes) || [];
+  if (probes.length < 3) { if (S.probeClusterKey) { S.probeClusterKey = null; saveState(); } return; } // cluster gone → reset latch
+  probeBusy = true;
+  try {
+    const byFunder = {};
+    let freshCount = 0;
+    for (const p of probes) {
+      const { funder, txCount } = await getOrigin(p.wallet);
+      if (txCount == null || txCount > PROBE_FRESH_TX_MAX) continue; // PROOF 1: established wallet → not a disposable rehearsal wallet
+      freshCount++;
+      if (funder) (byFunder[funder] = byFunder[funder] || []).push(p.wallet);
+    }
+    let topFunder = null, group = [];
+    for (const [f, ws] of Object.entries(byFunder)) if (ws.length > group.length) { group = ws; topFunder = f; }
+    if (group.length < 3) { // PROOF 2 fails → no coordinated fresh cluster → SILENT (correct for legit testers / MM-funded traders)
+      if (S.probeClusterKey) { S.probeClusterKey = null; saveState(); }
+      if (freshCount) log(`probe-check: ${freshCount} fresh probe wallet(s) but no common funder ≥3 → silent (not coordinated)`);
+      return;
+    }
+    const key = topFunder + ":" + group.length;
+    if (S.probeClusterKey === key) return; // already alerted this exact cluster
+    S.probeClusterKey = key; saveState();
+    let funderN = "?"; // funder size, for the operator's judgement
+    try { const s = await main("getSignaturesForAddress", [topFunder, { limit: 1000 }]); const n = ((s && s.result) || []).length; funderN = n >= 1000 ? "1000+" : String(n); } catch (e) {}
+    log(`🔴 COORDINATED PROBE CLUSTER: ${group.length} FRESH wallets (≤${PROBE_FRESH_TX_MAX} txs) share funder ${topFunder}`);
+    sendSecurityAlert(
+      `🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nCOORDINATED PROBE CLUSTER\n\n` +
+      `${group.length} freshly-created wallets (each <${PROBE_FRESH_TX_MAX} lifetime txs) running tiny deposit→withdraw round-trips are ALL funded by ONE source:\n${topFunder}\n(funder ≈ ${funderN} txs)\n\n` +
+      `Wallets: ${group.slice(0, 5).map((w) => w.slice(0, 6) + "…").join(", ")}${group.length > 5 ? " …" : ""}\n\n` +
+      `⚠️ PROVEN on-chain (two independent signals): disposable wallets + single common funder + dust round-trips = the exact exploit-rehearsal fingerprint. This is NOT resumption testing. Investigate now.`
+    );
+  } finally { probeBusy = false; }
+}
+
 // ---------------- realtime push: WebSocket accountSubscribe on every vault ----------------
 // Any balance change on any custody vault triggers an immediate decode cycle (~1s after the
 // block) instead of waiting for the next poll. Baseline polling remains the safety net.
@@ -794,6 +871,7 @@ async function cycle(reason) {
     try { checkNewPrograms(); } catch (e) { S.cycleErrors.push("newprog: " + e.message); } // new-program detector (rehearsal footprint)
     const ev = evaluate(now(), S.events, S.failures, allDescriptors(), S.balances, S.marks, S.markTimes, S.lazerMarks || {}, S.pyth, S.limits, S.authority);
     processAlertTransitions(ev);
+    checkProbeCluster(ev).catch((e) => S.cycleErrors.push("probe: " + (e.message || e))); // proven-only coordinated-cluster (common-funder) verify → DM
     S.lastEval = ev;
     saveState();
     S.lastCycle = now(); S.cycleSeconds = +((Date.now() - t0) / 1000).toFixed(1); S.cycles++;

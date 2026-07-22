@@ -1,0 +1,27 @@
+# Flash Flow Sentinel — always-on daemon on Fly.io (reliable deploys, no Railway build-API flakiness)
+app = "flash-flow-sentinel"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  NODE_ENV = "production"
+
+# Always-on: never auto-stop (this is a live monitor + WS accountSubscribe, must never sleep)
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+# persistent disk for state (withdrawal dedup watermark, conservation baselines) across deploys
+[[mounts]]
+  source = "ffs_data"
+  destination = "/app/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
