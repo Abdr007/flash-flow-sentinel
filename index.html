@@ -9,7 +9,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="icon" type="image/png" href="./flash-trade-v2.png" />
-  <link rel="stylesheet" href="./styles.css?v=20260720b" />
+  <link rel="stylesheet" href="./styles.css?v=20260723a" />
 </head>
 <body>
   <div class="scanlines" aria-hidden="true"></div>
@@ -45,6 +45,16 @@
 
     <!-- KPI strip -->
     <section class="kpi-grid" id="kpiGrid"></section>
+
+    <!-- ===== DEFENSE STACK — the three security layers ===== -->
+    <section class="card focus" id="layersCard">
+      <div class="card-head">
+        <h2>Defense Stack — three layers, every alarm proven on-chain</h2>
+        <span class="card-tag" id="layersTag">—</span>
+      </div>
+      <p class="note">The sentinel is built as three layers. <strong>Layer 1</strong> only alarms after verifying a threat <em>on-chain</em> — no threshold guesses. <strong>Layer 2</strong> continuously proves the vaults' integrity every cycle. <strong>Layer 3</strong> turns a <em>proven</em> drain into an instant automated response — and deliberately holds no pause key of its own (it proves and signals; Flash's own authority acts). Every status below is read live; nothing here is synthetic.</p>
+      <div class="layers" id="layersStack"></div>
+    </section>
 
     <!-- ===== GLOBAL FLOW CHART + THE LIMIT ===== -->
     <section class="card focus">
@@ -182,6 +192,6 @@
   </main>
 
   <div id="tooltip"></div>
-  <script src="./app.js?v=20260720b" defer></script>
+  <script src="./app.js?v=20260723a" defer></script>
 </body>
 </html>

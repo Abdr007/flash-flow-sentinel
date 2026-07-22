@@ -103,6 +103,33 @@ code{font-family:var(--mono);background:rgba(0,224,138,.08);border:1px solid var
 .vcheck-val{font-family:var(--mono);font-size:20px;font-weight:700;color:#eafff2}
 .vcheck.good .vcheck-val{color:var(--green)}
 .vcheck-sub{font-size:10.5px;color:var(--ink-faint);font-family:var(--mono)}
+
+/* ---- Defense Stack (security layers panel) ---- */
+.layers{display:flex;flex-direction:column;gap:13px;margin-top:6px}
+.layer{position:relative;background:rgba(8,14,12,.5);border:1px solid var(--line);border-radius:14px;padding:15px 18px 16px 22px;overflow:hidden}
+.layer::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px}
+.layer.l1::before{background:linear-gradient(180deg,#ccff00,#9bf24a)}
+.layer.l2::before{background:linear-gradient(180deg,#7ff05a,#00e08a)}
+.layer.l3::before{background:linear-gradient(180deg,#00e08a,#56b8ff)}
+.layer-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:4px;flex-wrap:wrap}
+.layer-title{display:flex;align-items:baseline;gap:11px;flex-wrap:wrap}
+.layer-num{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.14em;color:var(--ink-dim)}
+.layer-name{font-size:14.5px;font-weight:800;letter-spacing:.01em;color:#eafff2}
+.layer-badge{font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.06em;padding:4px 11px;border-radius:20px;border:1px solid var(--line);color:var(--ink-faint);white-space:nowrap}
+.layer-badge.ok{background:rgba(57,224,138,.12);border-color:rgba(57,224,138,.4);color:var(--green)}
+.layer-badge.warn{background:rgba(255,194,75,.12);border-color:rgba(255,194,75,.4);color:var(--amber)}
+.layer-badge.bad{background:rgba(255,84,112,.14);border-color:rgba(255,84,112,.45);color:var(--red)}
+.layer-badge.idle{background:rgba(86,184,255,.1);border-color:rgba(86,184,255,.32);color:var(--blue)}
+.layer-desc{font-size:11.5px;color:var(--ink-faint);margin:0 0 12px;line-height:1.5;max-width:900px}
+.layer-items{display:flex;flex-wrap:wrap;gap:8px}
+.layer-item{display:flex;align-items:center;gap:8px;background:rgba(5,10,8,.55);border:1px solid var(--line);border-radius:9px;padding:7px 12px;font-size:11.5px}
+.layer-item .li-dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);flex:none}
+.layer-item.warn .li-dot{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+.layer-item.bad .li-dot{background:var(--red);box-shadow:0 0 8px var(--red)}
+.layer-item.idle .li-dot{background:var(--ink-dim);box-shadow:none}
+.li-name{color:var(--ink-soft);font-weight:600;letter-spacing:.01em}
+.li-val{font-family:var(--mono);color:var(--ink-faint);font-size:11px}
+.layer-item.bad .li-val{color:var(--red)} .layer-item.warn .li-val{color:var(--amber)}
 .tick{font-weight:800;font-size:13px} .tick.ok{color:var(--green)} .tick.bad{color:var(--red)}
 
 /* ---------- KPI ---------- */
