@@ -165,7 +165,7 @@ function renderVerdict(S) {
     vc(consOk, "CONSERVATION", `${cx}/${cn}`, covDegraded ? "coverage degraded — see footer" : "baseline+Σdeltas == balance (u64)", "proof the monitor missed nothing — raw u64, zero tolerance"),
     vc(!!capOk, "CAPTURE", S.meta.wsPush ? "PUSH ⚡" : "POLL", `${S.failures1h} failed tx · 1h${S.meta.lastCycle ? " · " + ago(S.meta.lastCycle) + " ago" : ""}`, "WebSocket accountSubscribe on every vault + baseline poll"),
     // Layer 3 — proof-gated auto-containment. Shows the REAL posture from the API; any trip is a drain PROVEN on-chain (full lifetime history verified), never a guess.
-    vc(!contTrips, "L3 CONTAINMENT", contTrips ? contTrips + " CONTAINED" : cm.enabled ? "ARMED ⚡" : "STANDBY", contTrips ? "proven over-withdrawal auto-contained" : cm.enabled ? "proven-drain auto-response is live" : "proof-gated · arm to auto-respond", "Layer 3: on a wallet whose FULL on-chain history proves over-withdrawal, fires a max-priority alert + signed-intent webhook to Flash's authorized responder. The sentinel holds no pause key by design — signal, not authority."),
+    vc(!contTrips, "DRAIN DEFENSE", contTrips ? contTrips + " CONTAINED" : cm.enabled ? "ARMED ⚡" : "STANDBY", contTrips ? "proven drain auto-contained" : cm.enabled ? "auto-stops a proven drain" : "auto-response ready · arm to enable", "Auto-containment (Layer 3): when a wallet's FULL on-chain history proves it withdrew more than it deposited, this instantly fires a max-priority alert + a signed containment request to Flash's own pause system. The monitor holds no pause key itself — it proves and signals, Flash acts."),
   ].join("");
 }
 
