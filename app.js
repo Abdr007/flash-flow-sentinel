@@ -108,6 +108,7 @@ function renderVerdict(S) {
   const cons = S.conservation, cn = cons.rows.length, cx = cons.rows.filter((r) => r.status === "exact").length;
   const capOk = S.meta.lastCycle && (stalenessAge(S.meta) || 0) < 90;
   const govBad = (S.governance && (S.governance.changes || []).length) || 0;
+  const cm = S.containment || {}; const contTrips = (cm.trips || []).length; // Layer 3: proven-drain auto-containment trips
   const govStale = !!(S.governance && S.governance.staleSections && S.governance.staleSections.length); // a critical section read failed (e.g. ER outage)
   const oraDown = S.meta.oracleFeedCount === 0;   // the independent price source returned nothing → cross-check is blind
   const covDegraded = !!S.meta.coverageDegraded;  // a custody scan shrank the tracked set → coverage not authoritative
@@ -115,7 +116,7 @@ function renderVerdict(S) {
 
   const fs = freshnessState(S.meta);
   const degraded = fs !== "live";
-  const anyBreach = g.status === "breach" || tokBad || walBad || oraBad || govBad;
+  const anyBreach = g.status === "breach" || tokBad || walBad || oraBad || govBad || contTrips;
   const anyWarn = g.status === "warn" || tokWarn || walWarn || oraWarn || oraDown || govStale || covDegraded || !consOk;
   const v = $("verdict");
   v.classList.toggle("perfect", !degraded && !anyBreach && !anyWarn);
@@ -135,8 +136,11 @@ function renderVerdict(S) {
       $("verdictSub").textContent = `No fresh cycle in ${Math.round(stalenessAge(S.meta) || 0)}s. The last reading may be out of date — guard status is UNKNOWN until the monitor catches up.`;
     }
   } else if (anyBreach) {
-    $("verdictFlag").innerHTML = `⛔ <span style="color:var(--red)">${govBad ? "GOVERNANCE CHANGE" : "FLOW GUARD BREACH"}</span> — investigate now`;
+    $("verdictFlag").innerHTML = contTrips
+      ? `🚨 <span style="color:var(--red)">DRAIN CONTAINED</span> — proven over-withdrawal, auto-response fired`
+      : `⛔ <span style="color:var(--red)">${govBad ? "GOVERNANCE CHANGE" : "FLOW GUARD BREACH"}</span> — investigate now`;
     const parts = [];
+    if (contTrips) parts.push(`${contTrips} PROVEN drain${contTrips > 1 ? "s" : ""} auto-contained (full on-chain history verified)`);
     if (govBad) parts.push(`${govBad} authority/permission change${govBad > 1 ? "s" : ""} since baseline`);
     if (g.status === "breach") parts.push(`global outflow ${usd(g.out1hUsd)} exceeded the ${usd(g.limitUsdPerHour)}/h cap`);
     if (tokBad) parts.push(`${tokBad} token guard${tokBad > 1 ? "s" : ""}`);
@@ -160,6 +164,8 @@ function renderVerdict(S) {
     vc(!govBad && !govStale, "GOVERNANCE", govBad ? govBad + " CHANGE" : govStale ? "READ DEGRADED" : "STABLE", govStale ? "a governance read failed this cycle — watch is degraded" : S.governance && S.governance.upgradeControl && S.governance.upgradeControl.model === "squads-multisig" ? "Squads-gated upgrades · watched" : "authority surface watched", "upgrade authority, Squads control, program deploys, and permission flags — alerts on any change"),
     vc(consOk, "CONSERVATION", `${cx}/${cn}`, covDegraded ? "coverage degraded — see footer" : "baseline+Σdeltas == balance (u64)", "proof the monitor missed nothing — raw u64, zero tolerance"),
     vc(!!capOk, "CAPTURE", S.meta.wsPush ? "PUSH ⚡" : "POLL", `${S.failures1h} failed tx · 1h${S.meta.lastCycle ? " · " + ago(S.meta.lastCycle) + " ago" : ""}`, "WebSocket accountSubscribe on every vault + baseline poll"),
+    // Layer 3 — proof-gated auto-containment. Shows the REAL posture from the API; any trip is a drain PROVEN on-chain (full lifetime history verified), never a guess.
+    vc(!contTrips, "L3 CONTAINMENT", contTrips ? contTrips + " CONTAINED" : cm.enabled ? "ARMED ⚡" : "STANDBY", contTrips ? "proven over-withdrawal auto-contained" : cm.enabled ? "proven-drain auto-response is live" : "proof-gated · arm to auto-respond", "Layer 3: on a wallet whose FULL on-chain history proves over-withdrawal, fires a max-priority alert + signed-intent webhook to Flash's authorized responder. The sentinel holds no pause key by design — signal, not authority."),
   ].join("");
 }
 
