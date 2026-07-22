@@ -188,17 +188,13 @@ function processAlertTransitions(ev) {
   // team it must NOT be pushed to the main channel. We still record it on the dashboard + alert log; we just
   // suppress the external notification for oracle:* rules.
   const pushAlert = (a, tokens) => { if (!String(a.rule || "").startsWith("oracle:")) fireWebhook(a, tokens); };
-  // SECURITY alert → operator DM (bypasses the global mute when SECURITY_ALERTS=1). Fires ONLY on the genuine
-  // exploit signature — a per-wallet over-withdrawal (entitlement) — never on routine volume, so it can't spam.
-  const secSend = (key, st) => {
-    if (!SECURITY_ALERTS() || st.status !== "breach") return;
-    if (key.startsWith("entitlement:")) sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nOVER-WITHDRAWAL DETECTED\n\n${String(st.detail || "").replace(/^⚠ CRITICAL — entitlement anomaly:\s*/, "")}\n\n🔗 flash-flow-sentinel.vercel.app`);
-    // The composite threat rule DELETES entitlement:<wallet> when it fires (2+ signals) — so route it to the
-    // security DM too, or the strongest correlated over-withdrawal case would lose its dedicated alert.
-    else if (key.startsWith("threat:")) sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nCOORDINATED DRAIN PATTERN\n\n${String(st.detail || "").replace(/^⚠ /, "")}\n\n🔗 flash-flow-sentinel.vercel.app`);
-    // NOTE: probe-cluster is no longer routed here — it is decided by the async, on-chain-verified
-    // checkProbeCluster() (common-funding-source proof) so it can never fire on legit resumption testing.
-  };
+  // PROVEN-ONLY POLICY: the windowed entitlement/threat rules are HEURISTICS (a threshold on a 1h/24h window).
+  // A heuristic is NOT proof, so it NEVER DMs on its own — it only marks the wallet on the dashboard and sets
+  // cand.entitlement, which makes runContainment() re-verify that wallet on its NEXT pass. The actual Telegram
+  // alarm — the wallet's ENTIRE on-chain history checked to prove it withdrew more than it ever deposited — is
+  // sent by runContainment(). Likewise every other Telegram alarm (census solvency, conservation, phantom,
+  // fresh-program, probe-cluster, governance) is verified on-chain before it fires. No raw "breach" ever DMs.
+  const secSend = () => {};
   for (const [key, st] of Object.entries(next)) {
     const prev = S.alertsActive[key];
     if (!prev) {
