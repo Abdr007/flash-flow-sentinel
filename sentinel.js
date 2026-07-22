@@ -193,6 +193,9 @@ function processAlertTransitions(ev) {
   const secSend = (key, st) => {
     if (!SECURITY_ALERTS() || st.status !== "breach") return;
     if (key.startsWith("entitlement:")) sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nOVER-WITHDRAWAL DETECTED\n\n${String(st.detail || "").replace(/^⚠ CRITICAL — entitlement anomaly:\s*/, "")}\n\n🔗 flash-flow-sentinel.vercel.app`);
+    // The composite threat rule DELETES entitlement:<wallet> when it fires (2+ signals) — so route it to the
+    // security DM too, or the strongest correlated over-withdrawal case would lose its dedicated alert.
+    else if (key.startsWith("threat:")) sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nCOORDINATED DRAIN PATTERN\n\n${String(st.detail || "").replace(/^⚠ /, "")}\n\n🔗 flash-flow-sentinel.vercel.app`);
     // NOTE: probe-cluster is no longer routed here — it is decided by the async, on-chain-verified
     // checkProbeCluster() (common-funding-source proof) so it can never fire on legit resumption testing.
   };
@@ -646,8 +649,7 @@ async function checkNewPrograms() {
     try { const s = await main("getSlot", []); curSlot = s && s.result; } catch (e) {}
     const bs58 = require("bs58");
     for (const p of fresh) {
-      S.knownPrograms[p] = t; // baseline regardless — never re-verify the same program
-      if (p === PROG) continue; // never alarm on Flash's own program (it upgraded during remediation → looks "fresh")
+      if (p === PROG) { S.knownPrograms[p] = t; continue; } // never alarm on Flash's own program (it upgraded during remediation → looks "fresh")
       let verdict = "established", ageDays = null;
       try {
         const inf = await main("getAccountInfo", [p, { encoding: "base64" }]);
@@ -669,8 +671,16 @@ async function checkNewPrograms() {
           }
         } // owner !== upgradeable loader → established core/native
       } catch (e) { verdict = "unverified"; }
-      // PROVEN-ONLY: alarm ONLY when we can prove it's a freshly-deployed program. Established / core /
-      // unverifiable → baseline silently (never cry wolf without proof — per the operator directive).
+      // A transient RPC failure must NOT permanently baseline (and thus silence) a fresh program. Retry it on
+      // later cycles; only give up (baseline) after 3 unverifiable attempts so a permanently-odd account can't loop.
+      if (verdict === "unverified") {
+        S._progUnverified = S._progUnverified || {};
+        if ((S._progUnverified[p] = (S._progUnverified[p] || 0) + 1) >= 3) { S.knownPrograms[p] = t; log(`new program ${p} — unverifiable 3× → baselined (giving up)`); }
+        else log(`new program ${p} — unverified (transient RPC?), retrying next cycle`);
+        continue;
+      }
+      S.knownPrograms[p] = t; // conclusive verdict (established / fresh) → baseline, never re-verify
+      // PROVEN-ONLY: alarm ONLY when we can prove it's a freshly-deployed program. Established/core → baseline silently.
       if (verdict !== "fresh") { log(`new program ${p} — ${verdict}${ageDays != null ? ` (~${ageDays.toFixed(0)}d old)` : ""} — baselined silently, not an attack footprint`); continue; }
       const evs = S.events.filter((e) => Array.isArray(e.programs) && e.programs.includes(p));
       const sample = evs[evs.length - 1];
@@ -772,13 +782,30 @@ async function runContainment(ev) {
       const w = cand.wallet;
       if (S.containment.trips[w]) continue;                                  // already contained — latched
       const seen = S.containment.checked[w];
-      if (seen && (now() - seen.ts) < 1800 && !cand.entitlement) continue;   // don't re-trace an entitled/capped wallet within 30m unless entitlement-flagged
+      if (seen && (now() - seen.ts) < 1800 && !cand.entitlement && cand.out1hUsd <= (seen.out || 0) * 1.5) continue; // re-trace within 30m only if entitlement-flagged or the outflow grew >50%
       if (traced >= 3) break;                                                // bound on-chain proof work per cycle (rest re-checked next cycle)
       traced++;
-      const proof = await containment.verifyDrain(w, main, c, flashVaults);
-      S.containment.checked[w] = { ts: now(), capped: proof.capped, proven: proof.proven };
+      // Trace the collateral the candidate ACTUALLY withdrew — Layer 3 was USDC-only, so a SOL/BTC/ETH drain
+      // must be proven in its own mint and valued at its mark, or it would pass invisibly.
+      let mint = c.collateralMint, mintUsd = 0;
+      for (const e of S.events) { if (e.wallet !== w || e.direction !== "out" || !e.mint || (now() - e.blockTime) > 3600) continue; const u = e.usd || 0; if (u > mintUsd) { mintUsd = u; mint = e.mint; } }
+      let markUsd = 1;
+      if (mint !== c.collateralMint) { const tk = (ev.tokens || []).find((t) => t.mint === mint); markUsd = tk && tk.markUsd > 0 ? tk.markUsd : 0; }
+      // If the collateral can't be valued, we cannot PROVE over-withdrawal → escalate to a human, never stay silent.
+      if (markUsd === 0) {
+        if (cand.out1hUsd >= c.minUsd) { sendSecurityAlert(`🟠  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nLARGE WITHDRAWAL — NEEDS HUMAN REVIEW\n\nWallet ${w}\nwithdrew ~$${Math.round(cand.out1hUsd)} of an UNPRICED collateral in the last hour — auto-containment cannot value it to prove entitlement.\n\n⚠️ Verify this wallet manually now.`); log(`containment: ${w.slice(0, 8)} unpriced-collateral $${Math.round(cand.out1hUsd)}/1h → escalated to human`); }
+        S.containment.checked[w] = { ts: now(), out: cand.out1hUsd, capped: true, proven: false };
+        continue;
+      }
+      const proof = await containment.verifyDrain(w, main, { ...c, collateralMint: mint }, flashVaults, markUsd);
+      S.containment.checked[w] = { ts: now(), out: cand.out1hUsd, capped: proof.capped, proven: proof.proven };
       if (!proof.proven) {
-        if (proof.capped) log(`containment: ${w.slice(0, 8)} withdrew $${Math.round(cand.out1hUsd)}/1h but ${proof.reason} → escalated, NOT auto-contained`);
+        // A large withdrawal we could NOT auto-clear (history longer than we can fully trace) must still reach a
+        // human — "escalate to a human" is a real alert, not just a log line (Layer-3 design principle #2).
+        if (proof.capped && cand.out1hUsd >= c.minUsd) {
+          sendSecurityAlert(`🟠  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nLARGE WITHDRAWAL — NEEDS HUMAN REVIEW\n\nWallet ${w}\nwithdrew $${Math.round(cand.out1hUsd)} in the last hour; auto-containment could not clear it (${proof.reason}).\n\n⚠️ Not auto-contained (history too long to fully prove on-chain) — verify this wallet's entitlement manually now.`);
+          log(`containment: ${w.slice(0, 8)} $${Math.round(cand.out1hUsd)}/1h → escalated to human (${proof.reason})`);
+        }
         continue;
       }
       // PROVEN DRAIN → CONTAIN (latch, alarm, signal)
@@ -1018,6 +1045,9 @@ function snapshot() {
       skippedTxs: (S.skippedSigs || []).slice(-10).reverse(), // txs skipped after 6 undecodable retries (conservation drift still backstops any missed delta)
       oracleSource: S.pyth.source || "flash-api", lazer: { tokenPresent: !!S.lazer.token, ok: S.lazer.ok, reason: S.lazer.reason },
       channels: channelsConfigured(),
+      // Alerting posture — surfaced so a silenced monitor can NEVER look normal. muted = ALERTS_MUTED kills the
+      // primary flow-guard pushes; security/withdrawals/containment reflect the opt-in detector channels.
+      alerting: { muted: process.env.ALERTS_MUTED === "1", security: SECURITY_ALERTS(), withdrawals: WITHDRAWAL_ALERTS(), containment: containment.CONTAINMENT() },
       squadsMofN: process.env.SQUADS_MOFN || "3-of-7", // Squads governance threshold (operator-set, verifiable on the Squads app)
       limitsWritable: HOST === "127.0.0.1" && !process.env.LIMITS_WRITE_TOKEN, // public view is read-only
       dataNote: "All values decoded from real on-chain state: base-chain SPL transfers (exact u64 vault deltas from pre/post token balances, confirmed commitment), ER custody/oracle accounts via the program's own on-chain IDL, Pyth Lazer cross-check. Tracked vaults = every custody vault + TradeVault + RebateVault + FAF TokenVault, plus a balance sweep of EVERY token account owned by the program's vault authority — any untracked account that moves is auto-promoted to full per-transaction tracking. Capture is push-triggered by WebSocket accountSubscribe plus a baseline poll. Each flow is valued in USD at the on-chain oracle mark observed at capture (stablecoins at $1); a flow whose mark was not yet resolved at capture is valued once its mark is available, and shown as unpriced until then — never dropped. No synthetic data.",
