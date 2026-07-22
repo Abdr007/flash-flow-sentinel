@@ -28,6 +28,7 @@ const { fetchFlashLazerPrices, fetchFlashLazerIds } = require("./lib/flashprices
 const { DEFAULT_LIMITS, evaluate, ruleStates, hourlyBucketsBySide } = require("./lib/limits.cjs");
 const { fetchGovernance, diffGovernance, mergeGovernance } = require("./lib/authority.cjs");
 const { deliverAlert, heartbeat, sendTelegram, sendOperator, channelsConfigured } = require("./lib/notify.cjs");
+const reconwatch = require("./lib/reconwatch.cjs");
 
 // ---------------- config ----------------
 const ER_URL = process.env.ER_URL || "https://flashtrade.magicblock.app";
@@ -71,6 +72,9 @@ const S = {
   eventKeys: new Set(),      // `${vault}:${sig}` dedupe
   failures: [],              // { vault, sig, blockTime }
   conservation: {},          // vault → { baseRaw, baseTime, sumDeltas, residual, streak, status, rebases }
+  reconKnown: {},            // marketAccount → known basket-vs-market mismatch (persisted; only NEW ones alert)
+  reconSeeded: false,        // once true, a phantom present at first boot has been silently baselined
+  reconStatus: null,         // last census reconciliation summary { mismatched, marketSides, allExact, checkedAt }
   governance: null,          // live governance snapshot (upgrade auth, multisig, permissions)
   govBaseline: null,         // last-good full governance snapshot for change detection (persisted)
   govChanges: [],            // recorded governance changes (also alerts)
@@ -106,13 +110,15 @@ function loadState() {
     S.govBaseline = j.govBaseline || null;   // detect governance changes across restarts too
     S.govChanges = j.govChanges || [];
     S.conservation = j.conservation || {};   // persist the conservation baseline so a restart can't re-baseline away a pre-existing missed-transfer drift (false "exact")
+    S.reconKnown = j.reconKnown || {};        // persist known phantom mismatches so a restart doesn't re-alert them
+    S.reconSeeded = !!j.reconSeeded;
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  fs.writeFileSync(F_STATE, JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2));
+  fs.writeFileSync(F_STATE, JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2));
 }
 function loadEvents() {
   const cutoff = now() - RETENTION_HOURS * 3600;
@@ -436,6 +442,40 @@ async function checkGovernance() {
   S.govBaseline = gov;
 }
 
+// ---------------- reconciliation-anomaly watch (the 7-day-rehearsal catcher) ----------------
+// Poll the census basket-vs-market reconciliation and alert on the FIRST appearance of a phantom position
+// (a Market whose open-interest no longer matches the sum of the baskets behind it). A phantom is the
+// on-chain signature of a broken-entitlement / over-withdrawal path being EXERCISED — the exact fingerprint
+// the 2026-07-20 rehearsal left on-chain a full day before the live drain, which nothing alerted on.
+// Alerts route to the OPERATOR DM ONLY (private) — never the public channel — until explicitly promoted.
+async function checkReconciliation() {
+  let recon;
+  try { recon = await reconwatch.fetchReconciliation(); }
+  catch (e) { S.cycleErrors.push("recon: " + e.message); return; }
+  const t = now();
+  S.reconStatus = { mismatched: recon.mismatchedCount, marketSides: recon.marketSides, allExact: recon.allExact, checkedAt: t };
+
+  // Cold start: silently baseline whatever mismatch already exists (e.g. the known SOL-Short residue) so a
+  // pre-existing phantom is never fired as if it were brand-new. Only mismatches appearing AFTER this alert.
+  if (!S.reconSeeded) {
+    const n = reconwatch.seed(S.reconKnown, recon.mismatched, t);
+    S.reconSeeded = true;
+    log(`RECON seeded: ${n} pre-existing mismatch(es) baselined silently (${recon.marketSides} sides, ${recon.mismatchedCount} mismatched)`);
+    saveState();
+    return;
+  }
+
+  const { fresh, resolved } = reconwatch.diffMismatches(S.reconKnown, recon.mismatched, t);
+  for (const m of fresh) {
+    const detail = reconwatch.describe(m);
+    log(`RECON CRITICAL — new phantom position: ${detail}`);
+    // OPERATOR DM ONLY (private) — not the public channel, per standing instruction until promoted.
+    sendOperator(`🔴 FLASH FLOW SENTINEL — RECONCILIATION ANOMALY (NEW phantom position)\n\n${detail}\n\nA market's open interest no longer matches the baskets behind it — the on-chain fingerprint of an over-withdrawal / broken-entitlement path being exercised. This is the signal the 07-20 rehearsal left a day before the live drain. Investigate before it can be drained.\n\nCensus: flashtrade-v2-onchain-census.vercel.app`);
+  }
+  for (const m of resolved) log(`RECON resolved — ${m.pool}/${m.market} ${m.side} reconciles again`);
+  if (fresh.length || resolved.length) saveState();
+}
+
 // ---------------- realtime push: WebSocket accountSubscribe on every vault ----------------
 // Any balance change on any custody vault triggers an immediate decode cycle (~1s after the
 // block) instead of waiting for the next poll. Baseline polling remains the safety net.
@@ -512,8 +552,9 @@ async function refreshIndependentPrices() {
   } catch (e) { S.cycleErrors.push("flashapi prices: " + e.message); }
 }
 
-let lastCustodyRefresh = 0, busy = false, lastGovCheck = 0;
+let lastCustodyRefresh = 0, busy = false, lastGovCheck = 0, lastReconCheck = 0;
 const GOV_CHECK_MS = Number(process.env.GOV_CHECK_MS || 120000); // governance rarely changes; 5 RPCs
+const RECON_CHECK_MS = Number(process.env.RECON_CHECK_MS || 180000); // basket-vs-market reconciliation (1 census fetch)
 async function cycle(reason) {
   if (busy) return;
   busy = true;
@@ -539,6 +580,7 @@ async function cycle(reason) {
     checkConservation();
     await refreshIndependentPrices();
     if (Date.now() - lastGovCheck > GOV_CHECK_MS) { await checkGovernance(); lastGovCheck = Date.now(); }
+    if (Date.now() - lastReconCheck > RECON_CHECK_MS) { await checkReconciliation(); lastReconCheck = Date.now(); }
     S.events.sort((a, b) => a.blockTime - b.blockTime);
     pruneMemory();
     repriceEvents(); // value unpriced-at-ingest flows at the current mark so they count toward the caps
@@ -648,6 +690,9 @@ function snapshot() {
     hourly: hourlyBuckets(),
     hourlySides: hourlyBucketsBySide(now(), S.events, S.authority),
     conservation: { rows: consRows, allExact: consRows.length > 0 && consRows.every((r) => r.status === "exact"), sinceOldestBase: consRows.length ? Math.min(...consRows.map((r) => r.baseTime)) : null },
+    // reconciliation-anomaly watch: live basket-vs-market phantom-position count + the set currently open.
+    // A NEW phantom is the 7-day-rehearsal fingerprint (over-withdrawal path being exercised) — alerted privately.
+    reconciliation: S.reconStatus ? { ...S.reconStatus, openPhantoms: Object.values(S.reconKnown).map((m) => ({ market: m.market, side: m.side, pool: m.pool, posDiff: m.posDiff, firstSeen: m.firstSeen })) } : null,
     governance: S.governance ? { ...S.governance, changes: S.govChanges.slice(-40).reverse() } : null,
     alerts: redactWatchedAlerts(S.alertsActive, S.alertsLog.slice(-100).reverse()),
     events: S.events.slice(-250).reverse().map((e) => ({ ...e, kind: classify(e.ix || [], e.direction), internal: !!(S.authority && e.wallet === S.authority) })),
