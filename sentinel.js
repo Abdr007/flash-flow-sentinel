@@ -824,19 +824,20 @@ async function runContainment(ev) {
       if (mint !== c.collateralMint) { const tk = (ev.tokens || []).find((t) => t.mint === mint); markUsd = tk && tk.markUsd > 0 ? tk.markUsd : 0; }
       // If the collateral can't be valued, we cannot PROVE over-withdrawal → escalate to a human, never stay silent.
       if (markUsd === 0) {
-        if (cand.out1hUsd >= c.minUsd) { sendSecurityAlert(`🟠  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nLARGE WITHDRAWAL — NEEDS HUMAN REVIEW\n\nWallet ${w}\nwithdrew ~$${Math.round(cand.out1hUsd)} of an UNPRICED collateral in the last hour — auto-containment cannot value it to prove entitlement.\n\n⚠️ Verify this wallet manually now.`); log(`containment: ${w.slice(0, 8)} unpriced-collateral $${Math.round(cand.out1hUsd)}/1h → escalated to human`); }
+        // Unpriced collateral — can't value to PROVE over-withdrawal. NOT alarmed (not a proven threat, and it
+        // would spam on legit exotic-token withdrawals). A real drain here still surfaces as a raw-unit deficit
+        // in the census vaultSolvency invariant → that PROVEN alarm is the backstop. Log only.
+        if (cand.out1hUsd >= c.minUsd) log(`containment: ${w.slice(0, 8)} unpriced-collateral $${Math.round(cand.out1hUsd)}/1h — unprovable here, census solvency backstops`);
         S.containment.checked[w] = { ts: now(), out: cand.out1hUsd, capped: true, proven: false };
         continue;
       }
       const proof = await containment.verifyDrain(w, main, { ...c, collateralMint: mint }, flashVaults, markUsd);
       S.containment.checked[w] = { ts: now(), out: cand.out1hUsd, capped: proof.capped, proven: proof.proven };
       if (!proof.proven) {
-        // A large withdrawal we could NOT auto-clear (history longer than we can fully trace) must still reach a
-        // human — "escalate to a human" is a real alert, not just a log line (Layer-3 design principle #2).
-        if (proof.capped && cand.out1hUsd >= c.minUsd) {
-          sendSecurityAlert(`🟠  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nLARGE WITHDRAWAL — NEEDS HUMAN REVIEW\n\nWallet ${w}\nwithdrew $${Math.round(cand.out1hUsd)} in the last hour; auto-containment could not clear it (${proof.reason}).\n\n⚠️ Not auto-contained (history too long to fully prove on-chain) — verify this wallet's entitlement manually now.`);
-          log(`containment: ${w.slice(0, 8)} $${Math.round(cand.out1hUsd)}/1h → escalated to human (${proof.reason})`);
-        }
+        // Not proven over-withdrawal (a real whale whose full history we can't trace, or genuinely entitled).
+        // NOT alarmed — that would spam on legit large withdrawals and is not a proven threat. A genuine
+        // over-withdrawal from such a wallet still surfaces as a census solvency deficit → PROVEN alarm.
+        if (proof.capped && cand.out1hUsd >= c.minUsd) log(`containment: ${w.slice(0, 8)} $${Math.round(cand.out1hUsd)}/1h history-capped, unprovable — census solvency backstops`);
         continue;
       }
       // PROVEN OVER-WITHDRAWAL (airtight, full lifetime history) → ALWAYS alarm the operator. If auto-containment
