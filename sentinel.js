@@ -510,32 +510,44 @@ async function checkReconciliation() {
 // Bypasses the global mute on purpose (this is the one feed explicitly turned on) and carries no oracle content.
 const WITHDRAWAL_ALERTS = () => process.env.WITHDRAWAL_ALERTS === "1";
 const wKey = (e) => `${e.sig}:${e.custody}`;
+let wSending = false; // one send-batch at a time so a burst is never double-sent across overlapping cycles
 function notifyWithdrawals() {
-  if (!WITHDRAWAL_ALERTS()) return;
+  if (!WITHDRAWAL_ALERTS() || wSending) return;
   if (!S.wAlertFrom) { S.wAlertFrom = now(); log("withdrawal feed ENABLED — watermark set; notifying on all withdrawals from now (backlog not dumped)"); return; }
   const sent = S._wSent || (S._wSent = new Set(S.wAlertSent || []));
   const fresh = S.events.filter((e) => e.direction === "out" && e.sig && !(S.authority && e.wallet === S.authority) && e.blockTime >= S.wAlertFrom && !sent.has(wKey(e)));
   if (!fresh.length) return;
   fresh.sort((a, b) => a.blockTime - b.blockTime);
   const short = (w) => (w ? w.slice(0, 6) + "…" + w.slice(-4) : "?");
-  // Priced flows show USD; an unpriced one (LP-receipt token whose mark isn't resolved yet) shows the real
-  // token amount instead of a bare "—", so no notice ever looks broken. All values are real on-chain.
+  // Priced flows show USD; an unpriced one (LP-receipt token whose mark isn't resolved) shows the real token
+  // amount instead of a bare "—", so no notice ever looks broken. All values are real on-chain.
   const amtStr = (e) => (e.usd != null
     ? "$" + Number(e.usd).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " " + e.symbol
     : Number(e.amount || 0).toLocaleString("en-US", { maximumFractionDigits: 4 }) + " " + e.symbol);
-  const CAP = 12, shown = fresh.slice(0, CAP); // 12 lines × long solscan URLs stays safely under Telegram's 4096-char limit
-  let text;
-  if (shown.length === 1) {
-    const e = shown[0];
-    text = `💸 WITHDRAWAL · Flash V2\n${amtStr(e)} (${e.pool}) → ${short(e.wallet)} · ${e.kind}\nhttps://solscan.io/tx/${e.sig}`;
-  } else {
-    text = `💸 ${fresh.length} WITHDRAWALS · Flash V2\n\n` + shown.map((e) => `• ${amtStr(e)} (${e.pool}) → ${short(e.wallet)} · ${e.kind}\n  https://solscan.io/tx/${e.sig}`).join("\n");
-    if (fresh.length > CAP) text += `\n\n…+${fresh.length - CAP} more this cycle (see dashboard)`;
-  }
-  sendWithdrawalNotice(text);
-  for (const e of fresh) sent.add(wKey(e));
-  S.wAlertSent = [...sent].slice(-1500);
-  S._wSent = new Set(S.wAlertSent);
+  // Report EVERY withdrawal — NOTHING truncated. Chunk into messages of 10 lines (safely under Telegram's
+  // 4096-char limit) and send them ALL. A chunk's withdrawals are marked sent ONLY after its message actually
+  // delivers, so a failed send is retried next cycle and no withdrawal is ever lost. Chunks are spaced to
+  // respect Telegram rate limits; wSending serializes batches so a burst is never double-sent.
+  const CHUNK = 10, total = fresh.length, chunks = [];
+  for (let i = 0; i < total; i += CHUNK) chunks.push(fresh.slice(i, i + CHUNK));
+  wSending = true;
+  (async () => {
+    try {
+      for (let c = 0; c < chunks.length; c++) {
+        const part = chunks[c];
+        const hdr = total === 1 ? "💸 WITHDRAWAL · Flash V2"
+          : chunks.length === 1 ? `💸 ${total} WITHDRAWALS · Flash V2`
+          : `💸 Flash V2 withdrawals (${c * CHUNK + 1}–${c * CHUNK + part.length} of ${total})`;
+        const body = part.map((e) => `• ${amtStr(e)} (${e.pool}) → ${short(e.wallet)} · ${e.kind}\n  https://solscan.io/tx/${e.sig}`).join("\n");
+        const ok = await sendWithdrawalNotice(`${hdr}\n\n${body}`);
+        if (ok) { for (const e of part) sent.add(wKey(e)); }
+        else { log(`withdrawal notice FAILED (${part.length} withdrawals) — retrying next cycle (none dropped)`); }
+        if (c < chunks.length - 1) await new Promise((r) => setTimeout(r, 1100));
+      }
+      S.wAlertSent = [...sent].slice(-6000);
+      S._wSent = new Set(S.wAlertSent);
+    } finally { wSending = false; }
+  })();
 }
 
 // ---------------- realtime push: WebSocket accountSubscribe on every vault ----------------
