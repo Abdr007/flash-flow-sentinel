@@ -843,6 +843,7 @@ const server = http.createServer((req, res) => {
           if (j.perTokenOutflowUsdPerHour && typeof j.perTokenOutflowUsdPerHour === "object") { patch.perTokenOutflowUsdPerHour = {}; for (const [k, v] of Object.entries(j.perTokenOutflowUsdPerHour)) if (num(v) !== undefined) patch.perTokenOutflowUsdPerHour[k] = v; }
           if (num(j.perWalletOutflowUsdPerHour) !== undefined) patch.perWalletOutflowUsdPerHour = j.perWalletOutflowUsdPerHour;
           if (num(j.vaultDrawdownPctPerHour) !== undefined) patch.vaultDrawdownPctPerHour = j.vaultDrawdownPctPerHour;
+          if (num(j.drawdownMinUsd) !== undefined) patch.drawdownMinUsd = j.drawdownMinUsd;
           if (num(j.oracleDeviationPct) !== undefined) patch.oracleDeviationPct = j.oracleDeviationPct;
           if (j.webhookUrl === null || (typeof j.webhookUrl === "string" && isPublicHttpUrl(j.webhookUrl))) patch.webhookUrl = j.webhookUrl;
           S.limits = { ...S.limits, ...patch };
