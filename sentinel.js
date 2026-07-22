@@ -1141,7 +1141,7 @@ function snapshot() {
       channels: channelsConfigured(),
       // Alerting posture — surfaced so a silenced monitor can NEVER look normal. muted = ALERTS_MUTED kills the
       // primary flow-guard pushes; security/withdrawals/containment reflect the opt-in detector channels.
-      alerting: { muted: process.env.ALERTS_MUTED === "1", security: SECURITY_ALERTS(), withdrawals: WITHDRAWAL_ALERTS(), containment: containment.CONTAINMENT() },
+      alerting: { muted: process.env.ALERTS_MUTED === "1", security: SECURITY_ALERTS(), withdrawals: WITHDRAWAL_ALERTS(), containment: containment.CONTAINMENT(), liveStatus: LIVE_STATUS(), liveStatusPosted: !!S.liveStatusMsgId },
       squadsMofN: process.env.SQUADS_MOFN || "3-of-7", // Squads governance threshold (operator-set, verifiable on the Squads app)
       limitsWritable: HOST === "127.0.0.1" && !process.env.LIMITS_WRITE_TOKEN, // public view is read-only
       dataNote: "All values decoded from real on-chain state: base-chain SPL transfers (exact u64 vault deltas from pre/post token balances, confirmed commitment), ER custody/oracle accounts via the program's own on-chain IDL, Pyth Lazer cross-check. Tracked vaults = every custody vault + TradeVault + RebateVault + FAF TokenVault, plus a balance sweep of EVERY token account owned by the program's vault authority — any untracked account that moves is auto-promoted to full per-transaction tracking. Capture is push-triggered by WebSocket accountSubscribe plus a baseline poll. Each flow is valued in USD at the on-chain oracle mark observed at capture (stablecoins at $1); a flow whose mark was not yet resolved at capture is valued once its mark is available, and shown as unpriced until then — never dropped. No synthetic data.",
