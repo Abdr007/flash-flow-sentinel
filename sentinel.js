@@ -517,15 +517,19 @@ function notifyWithdrawals() {
   const fresh = S.events.filter((e) => e.direction === "out" && e.sig && !(S.authority && e.wallet === S.authority) && e.blockTime >= S.wAlertFrom && !sent.has(wKey(e)));
   if (!fresh.length) return;
   fresh.sort((a, b) => a.blockTime - b.blockTime);
-  const money = (n) => (n == null ? "—" : "$" + Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
   const short = (w) => (w ? w.slice(0, 6) + "…" + w.slice(-4) : "?");
+  // Priced flows show USD; an unpriced one (LP-receipt token whose mark isn't resolved yet) shows the real
+  // token amount instead of a bare "—", so no notice ever looks broken. All values are real on-chain.
+  const amtStr = (e) => (e.usd != null
+    ? "$" + Number(e.usd).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " " + e.symbol
+    : Number(e.amount || 0).toLocaleString("en-US", { maximumFractionDigits: 4 }) + " " + e.symbol);
   const CAP = 12, shown = fresh.slice(0, CAP); // 12 lines × long solscan URLs stays safely under Telegram's 4096-char limit
   let text;
   if (shown.length === 1) {
     const e = shown[0];
-    text = `💸 WITHDRAWAL · Flash V2\n${money(e.usd)}  ${e.symbol} (${e.pool}) → ${short(e.wallet)} · ${e.kind}\nhttps://solscan.io/tx/${e.sig}`;
+    text = `💸 WITHDRAWAL · Flash V2\n${amtStr(e)} (${e.pool}) → ${short(e.wallet)} · ${e.kind}\nhttps://solscan.io/tx/${e.sig}`;
   } else {
-    text = `💸 ${fresh.length} WITHDRAWALS · Flash V2\n\n` + shown.map((e) => `• ${money(e.usd)} ${e.symbol} (${e.pool}) → ${short(e.wallet)} · ${e.kind}\n  https://solscan.io/tx/${e.sig}`).join("\n");
+    text = `💸 ${fresh.length} WITHDRAWALS · Flash V2\n\n` + shown.map((e) => `• ${amtStr(e)} (${e.pool}) → ${short(e.wallet)} · ${e.kind}\n  https://solscan.io/tx/${e.sig}`).join("\n");
     if (fresh.length > CAP) text += `\n\n…+${fresh.length - CAP} more this cycle (see dashboard)`;
   }
   sendWithdrawalNotice(text);
