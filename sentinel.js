@@ -109,7 +109,8 @@ const S = {
   custodyHighWater: 0,     // most vaults ever seen in one scan (persisted → a flaky boot can't lower the bar; coverage-shrink guard)
   driftAccum: {},          // wallet → cumulative net outflow USD, persisted ACROSS event pruning — slow-drip nominator for the proof
   driftAccumAt: 0,         // watermark blockTime up to which drift has been accumulated
-  solvencyBuffer: { accum: 0, lastSurplus: null, lastAt: 0, alertAt: 0 }, // cross-domain unbacked-outflow watch: census surplus erosion PAIRED with base outflow (AFX buffer-drain, caught before insolvency)
+  solvencyBuffer: { accum: 0, lastSurplus: null, lastAt: 0, alertAt: 0 }, // cross-domain unbacked-outflow watch (coarse USD aggregate; FALLBACK when per-custody data absent)
+  custodyBacking: {},      // custody → { lastResidualHuman, lastAt, accumUsd } — PRECISE per-custody raw (mark-free) unbacked-outflow reconciliation; the deepest layer
   sse: new Set(),
 };
 
@@ -149,13 +150,14 @@ function loadState() {
     S.driftAccum = j.driftAccum || {};
     S.driftAccumAt = j.driftAccumAt || 0;
     S.solvencyBuffer = j.solvencyBuffer || { accum: 0, lastSurplus: null, lastAt: 0, alertAt: 0 };
+    S.custodyBacking = j.custodyBacking || {};
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, knownSettlers: S.knownSettlers, settlerSeeded: S.settlerSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastHourlySummary: S.lastHourlySummary, custodyHighWater: S.custodyHighWater, driftAccum: S.driftAccum, driftAccumAt: S.driftAccumAt, solvencyBuffer: S.solvencyBuffer, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
+  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, knownSettlers: S.knownSettlers, settlerSeeded: S.settlerSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastHourlySummary: S.lastHourlySummary, custodyHighWater: S.custodyHighWater, driftAccum: S.driftAccum, driftAccumAt: S.driftAccumAt, solvencyBuffer: S.solvencyBuffer, custodyBacking: S.custodyBacking, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
   // ATOMIC write: a crash mid-write must never leave a half-written state file (which would wipe the sent-
   // history on reboot and re-send withdrawals). Write to a temp file, then rename — rename is atomic on the
   // volume's filesystem, so readers only ever see a complete file.
@@ -662,15 +664,69 @@ function netVaultOutflowSince(sinceUnix) {
   }
   return Math.max(0, out - inn);
 }
-async function checkSolvencyBuffer(inv, t) {
+// Net priced base outflow for ONE custody since `sinceUnix` (USD), excluding internal authority reshuffles.
+function custodyNetOutflowUsdSince(custodyAcct, sinceUnix) {
+  const auth = S.authority; let out = 0, inn = 0;
+  for (const e of S.events) {
+    if (e.custody !== custodyAcct) continue;
+    if (e.blockTime == null || e.blockTime < sinceUnix) continue;
+    if (auth && e.wallet === auth) continue;
+    const usd = e.usd; if (usd == null || !Number.isFinite(usd)) continue;
+    if (e.direction === "out") out += usd; else if (e.direction === "in") inn += usd;
+  }
+  return Math.max(0, out - inn);
+}
+// PRECISE per-custody unbacked-outflow reconciliation (the deepest layer). For EACH custody, pair its mark-free
+// raw surplus buffer (census withdrawableResidual, token units) against that custody's OWN base outflow, per poll
+// interval — so a drain on custody A can't be masked by surplus on custody B, and marks (which move no tokens and
+// don't touch realized `owned`) contribute nothing. Fires with exact attribution: which custody, which vault, how
+// much unbacked. Returns true if it ran (per-custody data present) so the coarse USD aggregate can defer alarming.
+async function checkCustodyBacking(rows, inv, t) {
+  if (!Array.isArray(rows) || !rows.length) return false; // census predates custodyMap → caller uses USD fallback
+  let totalUnbacked = 0; const offenders = [];
+  for (const r of rows) {
+    const resid = r.residualHuman, mark = r.markPrice;
+    if (!Number.isFinite(resid)) continue;
+    const st = S.custodyBacking[r.custody] || { lastResidualHuman: null, lastAt: 0, accumUsd: 0 };
+    if (st.lastResidualHuman != null && mark != null) {
+      const dropHuman = st.lastResidualHuman - resid;                     // >0 = this custody's buffer shrank (token units)
+      const outUsd = st.lastAt ? custodyNetOutflowUsdSince(r.custody, st.lastAt) : 0; // real tokens that left THIS custody
+      if (dropHuman > 0 && outUsd > 0) st.accumUsd = Math.max(0, (st.accumUsd || 0) + Math.min(outUsd, dropHuman * mark));
+      if (dropHuman < 0) st.accumUsd = Math.max(0, (st.accumUsd || 0) - (-dropHuman) * mark); // recovery decays
+    }
+    st.accumUsd = Math.min(st.accumUsd || 0, SOLV_BUFFER_CAP);
+    st.lastResidualHuman = resid; st.lastAt = t;
+    S.custodyBacking[r.custody] = st;
+    if (st.accumUsd > 0) { totalUnbacked += st.accumUsd; offenders.push({ sym: r.symbol, pool: r.pool, vault: r.vault, accumUsd: st.accumUsd, status: r.vaultStatus }); }
+  }
+  offenders.sort((a, b) => b.accumUsd - a.accumUsd);
+  const maxOne = offenders.length ? offenders[0].accumUsd : 0;
+  const fire = maxOne >= SOLV_BUFFER_FLOOR || totalUnbacked >= SOLV_BUFFER_FLOOR;
+  if (fire && (!S._custBackAlertAt || t - S._custBackAlertAt > 1800)) {
+    S._custBackAlertAt = t;
+    const deficitNow = inv.deficit != null && Number(inv.deficit) > 0;
+    const top = offenders.slice(0, 5).map((o) => `• ${o.pool}/${o.sym}: ~$${Math.round(o.accumUsd).toLocaleString()} unbacked${o.status === "deficit" ? " (DEFICIT)" : ""} · vault ${String(o.vault).slice(0, 6)}…`).join("\n");
+    const delivered = !SECURITY_ALERTS() || await sendSecurityAlert(
+      `${deficitNow ? "🔴🔴" : "🟠"}  SECURITY · FLASH V2 ${deficitNow ? "🔴🔴" : ""}\n━━━━━━━━━━━━━━━━━━━━\nUNBACKED OUTFLOW — PER-CUSTODY (raw, mark-free)\n\n` +
+      `≈ $${Math.round(totalUnbacked).toLocaleString()} has left specific custodies WITHOUT their on-chain obligations falling to match — reconciled per-custody in raw token units (immune to price marks):\n\n${top}\n\n` +
+      `A legit withdrawal drops a custody's vault AND its owned/payable together (its buffer stays flat); this didn't — real tokens left while the custody's accounting held, the exact fingerprint of an over-withdrawal on that custody.\n\n` +
+      `${deficitNow ? "🔴 The census ALSO shows a vault deficit now — live drain. ACT NOW." : "Census still solvent overall (buffers not yet exhausted) — VERIFY these specific withdrawals are entitled NOW."}\n\n🔗 flashtrade-v2-onchain-census.vercel.app`);
+    if (delivered) log(`CUSTODY-BACKING ALARM sent — $${Math.round(totalUnbacked)} unbacked across ${offenders.length} custody(ies), top ${offenders[0].pool}/${offenders[0].sym} deficitNow=${deficitNow}`);
+    else S._custBackAlertAt = 0; // un-missable: undelivered → re-fire next poll
+  }
+  if (totalUnbacked < SOLV_BUFFER_FLOOR * 0.2 && S._custBackAlertAt) S._custBackAlertAt = 0;
+  saveState();
+  return true;
+}
+async function checkSolvencyBuffer(inv, t, silent) {
   const s = inv.surplusUsd;
   if (s == null || !Number.isFinite(s)) return;         // surplus not readable this scan → skip (never guess)
   const B = S.solvencyBuffer;
   const netOut = B.lastAt ? netVaultOutflowSince(B.lastAt) : 0; // real money out since the previous census poll
   const step = reconwatch.solvencyStep({ accum: B.accum, lastSurplus: B.lastSurplus }, s, netOut, SOLV_BUFFER_CAP);
   B.accum = step.accum; B.lastSurplus = step.lastSurplus; B.lastAt = t;
-  if (step.contribution > 0) log(`SOLVENCY-BUFFER: surplus $${Math.round(s).toLocaleString()} netOut $${Math.round(netOut).toLocaleString()} → +$${Math.round(step.contribution).toLocaleString()} unbacked (accum $${Math.round(B.accum).toLocaleString()}/${SOLV_BUFFER_FLOOR})`);
-  if (B.accum >= SOLV_BUFFER_FLOOR && (!B.alertAt || t - B.alertAt > 1800)) {
+  if (step.contribution > 0) log(`SOLVENCY-BUFFER${silent ? " (track-only)" : ""}: surplus $${Math.round(s).toLocaleString()} netOut $${Math.round(netOut).toLocaleString()} → +$${Math.round(step.contribution).toLocaleString()} unbacked (accum $${Math.round(B.accum).toLocaleString()}/${SOLV_BUFFER_FLOOR})`);
+  if (!silent && B.accum >= SOLV_BUFFER_FLOOR && (!B.alertAt || t - B.alertAt > 1800)) {
     B.alertAt = t;
     const deficitNow = inv.deficit != null && Number(inv.deficit) > 0;
     const delivered = !SECURITY_ALERTS() || await sendSecurityAlert(
@@ -720,7 +776,8 @@ async function checkReconciliation() {
   const stale = inv.asOfUnix != null && (t - inv.asOfUnix) > 1800; // census scan older than 30m → not a live witness
   S.reconStatus = { mismatched: recon.mismatchedCount, marketSides: recon.marketSides, allExact: recon.allExact, checkedAt: t,
     solvency: { present: inv.present, allHold: inv.allHold, fails: inv.fails, asOfUnix: inv.asOfUnix, stale, coveragePct: inv.coveragePct, deficit: inv.deficit,
-      surplusUsd: inv.surplusUsd, vaultUsd: inv.vaultUsd, ownedUsd: inv.ownedUsd, unbackedAccum: S.solvencyBuffer.accum } };
+      surplusUsd: inv.surplusUsd, vaultUsd: inv.vaultUsd, ownedUsd: inv.ownedUsd, unbackedAccum: S.solvencyBuffer.accum,
+      perCustodyUnbacked: Object.entries(S.custodyBacking).filter(([, v]) => v && v.accumUsd > 1).map(([c, v]) => ({ custody: c, unbackedUsd: Math.round(v.accumUsd) })) } };
 
   // ---- PROTOCOL SOLVENCY INVARIANTS (the single strongest signal) ----
   // If the census's own on-chain invariants FAIL, the protocol is provably insolvent / being drained. CRITICAL,
@@ -738,9 +795,14 @@ async function checkReconciliation() {
       log("RECON — census solvency invariants hold again");
       if (SECURITY_ALERTS()) sendSecurityAlert(`🟢  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nSOLVENCY RESTORED\n\nAll on-chain census invariants hold again (${inv.coveragePct || "?"} coverage).`);
     }
-    // cross-domain unbacked-outflow watch: pair the surplus buffer against real base outflow (catches an AFX-style
-    // drain eating the solvency margin while `vault >= owned` still holds — before it registers as insolvency).
-    try { await checkSolvencyBuffer(inv, t); } catch (e) { S.cycleErrors.push("solvbuffer: " + (e.message || e)); }
+    // cross-domain unbacked-outflow watch: catch an AFX-style drain eating the solvency margin while `vault >= owned`
+    // still holds — before it registers as insolvency. PRIMARY = precise per-custody raw reconciliation (mark-free,
+    // attributable); the coarse USD aggregate stays as a silent tracker (alarms only as a fallback if per-custody
+    // data is absent), so a real drain never double-alarms yet is never missed if custodyMap is unavailable.
+    try {
+      const ranPrecise = await checkCustodyBacking(full.backing, inv, t);
+      await checkSolvencyBuffer(inv, t, /*silent=*/ ranPrecise);
+    } catch (e) { S.cycleErrors.push("solvbuffer: " + (e.message || e)); }
   }
 
   // Cold start: silently baseline whatever phantom mismatch already exists so a pre-existing one is never fired
