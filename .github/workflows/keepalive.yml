@@ -1,0 +1,45 @@
+name: keep-alive
+
+# EXTERNAL waker — the one thing the in-app self-ping cannot do: revive a fully-dead
+# Render instance (crash / failed deploy / platform restart). Runs in GitHub's cloud,
+# independent of any laptop and of Render itself. Any inbound HTTP request wakes a
+# spun-down free-tier instance, so this guarantees the service is never left cold.
+#
+# GitHub Actions cron minimum is every 5 min. Scheduled runs can lag under load, so we
+# retry within a single run too — combined with the app's own 10-min self-ping, the
+# service stays warm even if one layer misses.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes (well under Render's ~15-min idle threshold)
+  workflow_dispatch: {}       # allow a manual "wake it now" from the Actions tab
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping Render (retry until it responds)
+        run: |
+          URL="https://flash-flow-sentinel.onrender.com/"
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -L --max-time 90 \
+                   -A "flash-flow-sentinel-keepalive-gha" "$URL" || echo "000")
+            echo "attempt $i -> HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "service is awake (HTTP 200)"; exit 0
+            fi
+            # cold start can take 30-60s on free tier; wait and retry
+            sleep 25
+          done
+          echo "::warning::keep-alive could not confirm HTTP 200 after retries — service may be mid-cold-start"
+          # do not fail the workflow: the retries above already generated the inbound
+          # traffic that triggers the wake; a red X here would just create alert noise.
+          exit 0
