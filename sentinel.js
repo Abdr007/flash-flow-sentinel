@@ -757,9 +757,11 @@ async function checkSolvencyBuffer(inv, t, silent) {
 // Both require a 2-check streak so a mid-settlement slot-skew blip between the two scans can't false-alarm.
 async function checkIndependentSolvency(inv, censusStale, t) {
   const O = S.ownSolvency;
+  O.attempts = (O.attempts || 0) + 1; O.lastAttemptAt = t; // persistent diagnostic — proves the function is reached
   let own;
   try { own = await solvency.computeSolvency(er, main); }
-  catch (e) { S.cycleErrors.push("ownsolv: " + (e.message || e)); return; } // witness unavailable this pass — never read as solvent
+  catch (e) { const msg = (e && (e.message || String(e))) || "?"; S.cycleErrors.push("ownsolv: " + msg); O.lastError = msg.slice(0, 200); O.lastErrorAt = t; saveState(); return; } // witness unavailable this pass — never read as solvent
+  O.lastError = null;
   // store the summary for the dashboard + persistence (keep streak/alert bookkeeping)
   Object.assign(O, { allSolvent: own.allSolvent, deficit: own.deficit, backed: own.backed, custodyCount: own.custodyCount, totalDeficitRaw: own.totalDeficitRaw, complete: own.complete, asOf: t });
 
@@ -879,6 +881,7 @@ async function checkReconciliation() {
       perCustodyUnbacked: Object.entries(S.custodyBacking).filter(([, v]) => v && v.accumUsd > 1).map(([c, v]) => ({ custody: c, unbackedUsd: Math.round(v.accumUsd) })),
       // the sentinel's OWN independent recompute (2nd witness) + whether it agrees with the census
       independent: { allSolvent: S.ownSolvency.allSolvent, deficit: S.ownSolvency.deficit, backed: S.ownSolvency.backed, custodyCount: S.ownSolvency.custodyCount, complete: S.ownSolvency.complete, asOf: S.ownSolvency.asOf,
+        attempts: S.ownSolvency.attempts || 0, lastError: S.ownSolvency.lastError || null, lastAttemptAt: S.ownSolvency.lastAttemptAt || 0,
         agreesWithCensus: S.ownSolvency.allSolvent == null ? null : (S.ownSolvency.allSolvent === (inv.allHold && (inv.deficit == null || Number(inv.deficit) === 0))) } } };
 
   // ---- PROTOCOL SOLVENCY INVARIANTS (the single strongest signal) ----
