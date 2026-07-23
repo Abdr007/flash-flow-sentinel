@@ -104,6 +104,9 @@ const S = {
   lastCycle: null, cycleSeconds: null, cycleErrors: [], cycles: 0,
   ready: false,            // false until the initial backfill completes → suppresses a premature green verdict
   coverageDegraded: null,  // set if a custody scan returned materially fewer vaults than the high-water mark
+  custodyHighWater: 0,     // most vaults ever seen in one scan (persisted → a flaky boot can't lower the bar; coverage-shrink guard)
+  driftAccum: {},          // wallet → cumulative net outflow USD, persisted ACROSS event pruning — slow-drip nominator for the proof
+  driftAccumAt: 0,         // watermark blockTime up to which drift has been accumulated
   sse: new Set(),
 };
 
@@ -137,13 +140,16 @@ function loadState() {
     S.containment = { trips: (j.containment && j.containment.trips) || {}, lastTrip: (j.containment && j.containment.lastTrip) || null, checked: {} };
     S.liveStatusMsgId = j.liveStatusMsgId || null;
     S.lastHourlySummary = j.lastHourlySummary || 0;
+    S.custodyHighWater = j.custodyHighWater || 0;
+    S.driftAccum = j.driftAccum || {};
+    S.driftAccumAt = j.driftAccumAt || 0;
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastHourlySummary: S.lastHourlySummary, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
+  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastHourlySummary: S.lastHourlySummary, custodyHighWater: S.custodyHighWater, driftAccum: S.driftAccum, driftAccumAt: S.driftAccumAt, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
   // ATOMIC write: a crash mid-write must never leave a half-written state file (which would wipe the sent-
   // history on reboot and re-send withdrawals). Write to a temp file, then rename — rename is atomic on the
   // volume's filesystem, so readers only ever see a complete file.
@@ -426,23 +432,34 @@ function maybeSendWeekly() {
 }
 
 // ---------------- core cycle ----------------
-let custodyHighWater = 0;
+let coverageMissStreak = 0, coverageAlertAt = 0;
 async function refreshCustodies() {
   const { custodies, pools, erSlot } = await scanCustodies(er);
-  if (!custodies.length) return; // a fully-empty scan is a transient RPC failure — keep the last-good set
-  // Coverage-shrink guard: a partial/truncated getProgramAccounts (or one Borsh decode failure) must
-  // NOT silently replace the full set with a smaller one — that would shrink conservation coverage while
-  // still reporting "N/N exact" for the new smaller N. If the scan drops materially below the high-water
-  // mark, keep the prior set and raise a degraded signal instead of trusting the shrunken result.
-  if (custodyHighWater && custodies.length < custodyHighWater * 0.8) {
-    S.coverageDegraded = `custody scan returned ${custodies.length} vaults (expected ~${custodyHighWater}) — keeping last-good coverage`;
+  if (!custodies.length) return; // fully-empty scan = transient RPC failure — keep the last-good set
+  // Coverage-shrink guard: a partial/truncated scan must NOT silently replace the full set with a smaller one
+  // (that drops a vault from conservation while still reporting "N/N exact" — perfect cover for a drain). If the
+  // count falls materially below the PERSISTED high-water OR a previously-tracked vault DISAPPEARS, keep the
+  // last-good set and ALARM the operator privately (rate-limited). Only after the reduced set persists ~5min do
+  // we accept it as a real change (a legit vault removal) and rebaseline — jitter/attack never drops a vault.
+  const hw = S.custodyHighWater || 0;
+  const newSet = new Set(custodies.map((c) => c.custody));
+  const missing = (S.custodies || []).map((c) => c.custody).filter((k) => !newSet.has(k));
+  const degraded = (hw && custodies.length < hw * 0.8) || missing.length > 0;
+  if (degraded && ++coverageMissStreak < 30) {
+    S.coverageDegraded = `scan returned ${custodies.length}/${hw} vaults${missing.length ? `, ${missing.length} tracked vault(s) missing` : ""} — keeping last-good coverage`;
     S.cycleErrors.push(S.coverageDegraded);
     if (erSlot) S.erSlot = erSlot;
+    const t0 = now();
+    if (SECURITY_ALERTS() && t0 - coverageAlertAt > 1800) {
+      coverageAlertAt = t0;
+      sendSecurityAlert(`🟠  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nVAULT COVERAGE SHRANK\n\nLatest scan: ${custodies.length} vaults (high-water ${hw}).${missing.length ? `\n${missing.length} previously-tracked vault(s) DISAPPEARED: ${missing.slice(0, 5).map((k) => String(k).slice(0, 6) + "…").join(", ")}` : ""}\n\n⚠️ Keeping last-good coverage so no vault is silently dropped — a vanishing vault can hide a drain. Check the RPC/scan now.\n\n🔗 flash-flow-sentinel.vercel.app`);
+    }
     return;
   }
+  if (degraded) log(`coverage: reduced set persisted ${coverageMissStreak} scans → accepting as new baseline (${custodies.length} vaults)`);
   S.custodies = custodies; S.pools = pools; S.erSlot = erSlot;
-  custodyHighWater = Math.max(custodyHighWater, custodies.length);
-  S.coverageDegraded = null;
+  S.custodyHighWater = degraded ? custodies.length : Math.max(hw, custodies.length);
+  coverageMissStreak = 0; S.coverageDegraded = null;
 }
 const realC = () => S.custodies.filter((c) => !c.isVirtual); // custodies that own SPL vaults
 const tracked = () => [...realC(), ...S.named, ...Object.values(S.dynamic)]; // every fully-tracked vault
@@ -647,9 +664,11 @@ async function checkReconciliation() {
   // trusted when the invariant suite is present AND the census scan is fresh.
   if (inv.present && !stale) {
     if (!inv.allHold && !S.censusInvariantBad) {
-      S.censusInvariantBad = true; saveState();
       log(`RECON CRITICAL — census solvency invariant FAILED: ${inv.fails.join("; ")}`);
-      if (SECURITY_ALERTS()) sendSecurityAlert(`🔴🔴 SECURITY · FLASH V2 🔴🔴\n━━━━━━━━━━━━━━━━━━━━\nPROTOCOL SOLVENCY INVARIANT FAILED\n\nThe on-chain census proves ${inv.fails.length} invariant(s) NO LONGER HOLD:\n• ${inv.fails.join("\n• ")}${inv.deficit ? `\n\nVault deficit: ${inv.deficit}` : ""}\n\n⚠️ PROVEN on-chain (raw u64, independent scan): the protocol is under-collateralised or being drained. Strongest signal the monitor has — ACT NOW.\n\n🔗 flashtrade-v2-onchain-census.vercel.app`);
+      // UN-MISSABLE: latch ONLY after CONFIRMED delivery to the private DM. If Telegram is down, do NOT latch →
+      // this re-fires every recon cycle until it lands. (If alerts are off there's nothing to deliver → latch.)
+      const delivered = !SECURITY_ALERTS() || await sendSecurityAlert(`🔴🔴 SECURITY · FLASH V2 🔴🔴\n━━━━━━━━━━━━━━━━━━━━\nPROTOCOL SOLVENCY INVARIANT FAILED\n\nThe on-chain census proves ${inv.fails.length} invariant(s) NO LONGER HOLD:\n• ${inv.fails.join("\n• ")}${inv.deficit ? `\n\nVault deficit: ${inv.deficit}` : ""}\n\n⚠️ PROVEN on-chain (raw u64, independent scan): the protocol is under-collateralised or being drained. Strongest signal the monitor has — ACT NOW.\n\n🔗 flashtrade-v2-onchain-census.vercel.app`);
+      if (delivered) { S.censusInvariantBad = true; saveState(); }
     } else if (inv.allHold && S.censusInvariantBad) {
       S.censusInvariantBad = false; saveState();
       log("RECON — census solvency invariants hold again");
@@ -911,6 +930,22 @@ async function checkProbeCluster(ev) {
 // Nominates candidates from the live eval, proves over-withdrawal on-chain (full-history),
 // and on PROOF fires the automated response: max-priority alert + signed-intent webhook to
 // Flash's authorized responder. Latched (contains once per wallet). Gated by CONTAINMENT=1.
+// Slow-drip accumulator: track each wallet's CUMULATIVE net outflow (out − in) in USD, persisted across event
+// pruning. A drip that stays under every 1h/24h velocity threshold still creeps this total up — and any wallet
+// past the floor is nominated for the full-history proof. Reset when a wallet is proven entitled.
+function updateDriftAccum() {
+  S.driftAccum = S.driftAccum || {}; const since = S.driftAccumAt || 0; let maxT = since;
+  for (const e of S.events) {
+    if (!e.wallet || e.blockTime <= since || (S.authority && e.wallet === S.authority)) continue;
+    const u = e.usd || 0;
+    S.driftAccum[e.wallet] = (S.driftAccum[e.wallet] || 0) + (e.direction === "out" ? u : -u);
+    if (e.blockTime > maxT) maxT = e.blockTime;
+  }
+  S.driftAccumAt = maxT;
+  for (const w of Object.keys(S.driftAccum)) if (!(S.driftAccum[w] > 500)) delete S.driftAccum[w]; // drop noise + net-inflow wallets
+  const ks = Object.keys(S.driftAccum);
+  if (ks.length > 2000) { const keep = {}; for (const w of ks.sort((a, b) => S.driftAccum[b] - S.driftAccum[a]).slice(0, 2000)) keep[w] = S.driftAccum[w]; S.driftAccum = keep; }
+}
 let containBusy = false;
 async function runContainment(ev) {
   // The airtight lifetime-proof runs whenever the operator wants security alerts OR has armed auto-containment.
@@ -918,6 +953,9 @@ async function runContainment(ev) {
   if ((!SECURITY_ALERTS() && !containment.CONTAINMENT()) || containBusy) return;
   const c = containment.cfg();
   const cands = containment.selectCandidates(ev, c);
+  // slow-drip: also nominate any wallet whose CUMULATIVE net outflow has crept past the floor (survives pruning)
+  const nominated = new Set(cands.map((x) => x.wallet));
+  for (const [w, cum] of Object.entries(S.driftAccum || {})) if (cum >= c.minUsd && !nominated.has(w)) cands.push({ wallet: w, out1hUsd: 0, out24hUsd: cum, in24hUsd: 0, entitlement: false });
   if (!cands.length) return;
   cands.sort((a, b) => (b.out1hUsd || 0) - (a.out1hUsd || 0) || (b.out24hUsd || 0) - (a.out24hUsd || 0)); // prove the biggest/most-live withdrawals first
   containBusy = true;
@@ -952,6 +990,7 @@ async function runContainment(ev) {
         // Not proven over-withdrawal (a real whale whose full history we can't trace, or genuinely entitled).
         // NOT alarmed — that would spam on legit large withdrawals and is not a proven threat. A genuine
         // over-withdrawal from such a wallet still surfaces as a census solvency deficit → PROVEN alarm.
+        if (S.driftAccum) delete S.driftAccum[w]; // cleared → reset its drip accumulator so it doesn't re-nominate
         if (proof.capped && cand.out1hUsd >= c.minUsd) log(`containment: ${w.slice(0, 8)} $${Math.round(cand.out1hUsd)}/1h history-capped, unprovable — census solvency backstops`);
         continue;
       }
@@ -1096,6 +1135,7 @@ async function cycle(reason) {
     const ev = evaluate(now(), S.events, S.failures, allDescriptors(), S.balances, S.marks, S.markTimes, S.lazerMarks || {}, S.pyth, S.limits, S.authority);
     processAlertTransitions(ev);
     checkProbeCluster(ev).catch((e) => S.cycleErrors.push("probe: " + (e.message || e))); // proven-only coordinated-cluster (common-funder) verify → DM
+    updateDriftAccum(); // accumulate per-wallet cumulative net outflow (slow-drip nominator), before containment
     runContainment(ev).catch((e) => S.cycleErrors.push("contain: " + (e.message || e)));  // Layer 3: proven-drain full-history verify → auto-response
     S.lastEval = ev;
     saveState();
