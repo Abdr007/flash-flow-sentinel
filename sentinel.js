@@ -91,6 +91,7 @@ const S = {
   containment: { trips: {}, lastTrip: null, checked: {} }, // Layer 3: proven-drain trips (persisted) + in-memory verify cache
   liveStatusMsgId: null,     // Telegram message_id of the live-status message (edited in place every minute; persisted so restarts reuse it, no dupes)
   liveStatusLast: 0,         // last live-status edit time (in-memory)
+  lastHourlySummary: 0,      // last hourly transaction-report send (persisted so a restart doesn't re-send within the hour)
   lastDigestUnix: 0,         // last daily-digest broadcast (persisted; survives restarts)
   lastWeeklyUnix: 0,         // last weekly deep-dive broadcast (persisted)
   pyth: { feeds: {}, prices: {}, source: "flash-api" },
@@ -135,13 +136,14 @@ function loadState() {
     S.probeClusterKey = j.probeClusterKey || null;
     S.containment = { trips: (j.containment && j.containment.trips) || {}, lastTrip: (j.containment && j.containment.lastTrip) || null, checked: {} };
     S.liveStatusMsgId = j.liveStatusMsgId || null;
+    S.lastHourlySummary = j.lastHourlySummary || 0;
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
+  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastHourlySummary: S.lastHourlySummary, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
   // ATOMIC write: a crash mid-write must never leave a half-written state file (which would wipe the sent-
   // history on reboot and re-send withdrawals). Write to a temp file, then rename — rename is atomic on the
   // volume's filesystem, so readers only ever see a complete file.
@@ -309,6 +311,61 @@ async function maybeSendLiveStatus() {
     S.liveStatusLast = now();
   } catch (e) { S.cycleErrors.push("livestatus: " + (e.message || e)); }
   finally { liveStatusBusy = false; }
+}
+// ---------------- hourly transaction report → operator's private DM ----------------
+const HOURLY_SUMMARY = () => process.env.HOURLY_SUMMARY === "1";
+const HOURLY_SUMMARY_SEC = Number(process.env.HOURLY_SUMMARY_SEC || 3600);
+function composeHourlySummary() {
+  const cut = now() - HOURLY_SUMMARY_SEC;
+  const evs = (S.events || []).filter((e) => e.blockTime >= cut && !(S.authority && e.wallet === S.authority)); // exclude internal vault→vault
+  const outEv = evs.filter((e) => e.direction === "out"), inEv = evs.filter((e) => e.direction === "in");
+  const sum = (a) => a.reduce((s, e) => s + (e.usd || 0), 0);
+  const outUsd = sum(outEv), inUsd = sum(inEv);
+  const usd = (n) => "$" + Math.round(n || 0).toLocaleString("en-US");
+  // outflow by token
+  const byTok = {};
+  for (const e of outEv) { const k = e.symbol || "?"; (byTok[k] = byTok[k] || { usd: 0, n: 0 }); byTok[k].usd += e.usd || 0; byTok[k].n++; }
+  const tokLines = Object.entries(byTok).sort((a, b) => b[1].usd - a[1].usd).slice(0, 8).map(([k, v]) => `• ${k}: ${usd(v.usd)} (${v.n})`);
+  // top withdrawers
+  const byW = {};
+  for (const e of outEv) { if (!e.wallet) continue; byW[e.wallet] = (byW[e.wallet] || 0) + (e.usd || 0); }
+  const topW = Object.entries(byW).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([w, u]) => `• ${w.slice(0, 8)}…  ${usd(u)}`);
+  // types
+  const kinds = {};
+  for (const e of evs) { const k = classify(e.ix || [], e.direction) || "OTHER"; kinds[k] = (kinds[k] || 0) + 1; }
+  const kindLine = Object.entries(kinds).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${k} ${n}`).join(" · ");
+  // biggest single txs (with links)
+  const big = outEv.slice().sort((a, b) => (b.usd || 0) - (a.usd || 0)).slice(0, 3).map((e) => `• ${usd(e.usd)} ${e.symbol || ""} ${(classify(e.ix || [], e.direction) || "")} · solscan.io/tx/${String(e.sig || "").slice(0, 12)}…`);
+  // guard state
+  const ev = S.lastEval || {}; const rows = conservationRows(); const consOk = rows.length && rows.every((r) => r.status === "exact");
+  const sv = S.reconStatus && S.reconStatus.solvency; const tokBad = ((ev.tokens) || []).filter((t) => t.status === "breach").length;
+  const contTrips = Object.keys(S.containment.trips || {}).length;
+  const hh = new Date(now() * 1000).toISOString().slice(11, 16);
+  return [
+    `📊 HOURLY REPORT · FLASH V2 · ${hh} UTC`,
+    `━━━━━━━━━━━━━━━━━━━━`,
+    `${evs.length} transactions in the last 60m`,
+    `Outflow ${usd(outUsd)} (${outEv.length}) · Inflow ${usd(inUsd)} (${inEv.length}) · Net ${usd(inUsd - outUsd)}`,
+    ``,
+    ...(tokLines.length ? ["Outflow by token:", ...tokLines, ""] : ["No outflow this hour.", ""]),
+    ...(topW.length ? ["Top withdrawers:", ...topW, ""] : []),
+    ...(kindLine ? [`Types: ${kindLine}`, ""] : []),
+    ...(big.length ? ["Largest:", ...big, ""] : []),
+    `Guards: ${tokBad || contTrips ? "⚠️ " + (tokBad + " token / " + contTrips + " drain") : "all green ✅"} · conservation ${consOk ? "exact ✅" : "syncing"} · solvency ${sv && sv.allHold ? "hold ✅" : "—"}`,
+    `Every number decoded from the chain — no synthetic data.`,
+    `🔗 flash-flow-sentinel.vercel.app`,
+  ].join("\n");
+}
+let hourlyBusy = false;
+async function maybeSendHourlySummary() {
+  if (!HOURLY_SUMMARY() || hourlyBusy || !S.ready) return;
+  if (S.lastHourlySummary && now() - S.lastHourlySummary < HOURLY_SUMMARY_SEC) return;
+  hourlyBusy = true;
+  try {
+    const r = await sendSecurityAlert(composeHourlySummary()); // reliable private-DM channel (4× retry, confirmed delivery)
+    if (r) { S.lastHourlySummary = now(); saveState(); } // advance only on confirmed delivery, so a failed send retries next cycle
+  } catch (e) { S.cycleErrors.push("hourly: " + (e.message || e)); }
+  finally { hourlyBusy = false; }
 }
 function maybeSendDigest() {
   if (!S.lastEval) return; // wait until we have a real evaluation
@@ -902,11 +959,14 @@ async function runContainment(ev) {
       // PROVEN OVER-WITHDRAWAL (airtight, full lifetime history) → ALWAYS alarm the operator. If auto-containment
       // is armed (CONTAINMENT=1), ALSO fire the signed pause-request to Flash's responder.
       const contained = containment.CONTAINMENT();
+      log(`🚨🚨 PROVEN OVER-WITHDRAWAL: ${w} — $${Math.round(proof.lifetimeOut)} out vs $${Math.round(proof.lifetimeIn)} in (${proof.txCount}-tx full history)${contained ? " — CONTAINING" : ""}`);
+      // CRITICAL: latch (and fire the auto-response) ONLY after the alarm is CONFIRMED delivered. If Telegram is
+      // down, we do NOT latch — the wallet is re-verified + the alarm re-sent every cycle until it lands. Un-missable.
+      const delivered = await sendSecurityAlert(containment.buildAlarmText(proof, c, contained));
+      if (!delivered) { log(`containment alarm for ${w.slice(0, 8)} NOT delivered — re-attempting next cycle (not latched)`); delete S.containment.checked[w]; continue; }
       S.containment.trips[w] = { wallet: w, lifetimeOut: proof.lifetimeOut, lifetimeIn: proof.lifetimeIn, ratio: proof.ratio === Infinity ? null : proof.ratio, txCount: proof.txCount, sigs: proof.sigs, mint, markUsd, contained, at: now() };
       S.containment.lastTrip = now();
       saveState();
-      log(`🚨🚨 PROVEN OVER-WITHDRAWAL: ${w} — $${Math.round(proof.lifetimeOut)} out vs $${Math.round(proof.lifetimeIn)} in (${proof.txCount}-tx full history)${contained ? " — CONTAINING" : ""}`);
-      sendSecurityAlert(containment.buildAlarmText(proof, c, contained)); // proven → always DM (its own gate; fires even if mute is on)
       if (contained && c.webhook && isPublicHttpUrl(c.webhook)) {
         fetch(c.webhook, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(containment.buildPayload(proof, c)), signal: AbortSignal.timeout(8000) })
           .then((r) => log(`containment signal POSTed to responder → ${r && r.ok ? "accepted" : "non-200"}`))
@@ -1045,6 +1105,7 @@ async function cycle(reason) {
     maybeSendDigest(); // daily status broadcast to the channel
     maybeSendWeekly(); // weekly deep-dive broadcast
     maybeSendLiveStatus(); // live status → operator DM, edited in place every minute (no spam)
+    maybeSendHourlySummary(); // hourly transaction report → operator DM (new message each hour)
     if (freshCount) log(`cycle #${S.cycles}${reason ? ` (${reason})` : ""}: +${freshCount} events, ${S.cycleSeconds}s, global out1h $${ev.global.out1hUsd} [${ev.global.status}]`);
     broadcast();
   } catch (e) {
