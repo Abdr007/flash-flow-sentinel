@@ -317,44 +317,38 @@ const HOURLY_SUMMARY = () => process.env.HOURLY_SUMMARY === "1";
 const HOURLY_SUMMARY_SEC = Number(process.env.HOURLY_SUMMARY_SEC || 3600);
 function composeHourlySummary() {
   const cut = now() - HOURLY_SUMMARY_SEC;
-  const evs = (S.events || []).filter((e) => e.blockTime >= cut && !(S.authority && e.wallet === S.authority)); // exclude internal vault→vault
+  const evs = (S.events || []).filter((e) => e.blockTime >= cut && !(S.authority && e.wallet === S.authority)).sort((a, b) => a.blockTime - b.blockTime); // chronological, internal vault→vault excluded
   const outEv = evs.filter((e) => e.direction === "out"), inEv = evs.filter((e) => e.direction === "in");
   const sum = (a) => a.reduce((s, e) => s + (e.usd || 0), 0);
-  const outUsd = sum(outEv), inUsd = sum(inEv);
   const usd = (n) => "$" + Math.round(n || 0).toLocaleString("en-US");
-  // outflow by token
-  const byTok = {};
-  for (const e of outEv) { const k = e.symbol || "?"; (byTok[k] = byTok[k] || { usd: 0, n: 0 }); byTok[k].usd += e.usd || 0; byTok[k].n++; }
-  const tokLines = Object.entries(byTok).sort((a, b) => b[1].usd - a[1].usd).slice(0, 8).map(([k, v]) => `• ${k}: ${usd(v.usd)} (${v.n})`);
-  // top withdrawers
-  const byW = {};
-  for (const e of outEv) { if (!e.wallet) continue; byW[e.wallet] = (byW[e.wallet] || 0) + (e.usd || 0); }
-  const topW = Object.entries(byW).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([w, u]) => `• ${w.slice(0, 8)}…  ${usd(u)}`);
-  // types
-  const kinds = {};
-  for (const e of evs) { const k = classify(e.ix || [], e.direction) || "OTHER"; kinds[k] = (kinds[k] || 0) + 1; }
-  const kindLine = Object.entries(kinds).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${k} ${n}`).join(" · ");
-  // biggest single txs (with links)
-  const big = outEv.slice().sort((a, b) => (b.usd || 0) - (a.usd || 0)).slice(0, 3).map((e) => `• ${usd(e.usd)} ${e.symbol || ""} ${(classify(e.ix || [], e.direction) || "")} · solscan.io/tx/${String(e.sig || "").slice(0, 12)}…`);
-  // guard state
   const ev = S.lastEval || {}; const rows = conservationRows(); const consOk = rows.length && rows.every((r) => r.status === "exact");
   const sv = S.reconStatus && S.reconStatus.solvency; const tokBad = ((ev.tokens) || []).filter((t) => t.status === "breach").length;
   const contTrips = Object.keys(S.containment.trips || {}).length;
   const hh = new Date(now() * 1000).toISOString().slice(11, 16);
-  return [
+  const header = [
     `📊 HOURLY REPORT · FLASH V2 · ${hh} UTC`,
     `━━━━━━━━━━━━━━━━━━━━`,
     `${evs.length} transactions in the last 60m`,
-    `Outflow ${usd(outUsd)} (${outEv.length}) · Inflow ${usd(inUsd)} (${inEv.length}) · Net ${usd(inUsd - outUsd)}`,
-    ``,
-    ...(tokLines.length ? ["Outflow by token:", ...tokLines, ""] : ["No outflow this hour.", ""]),
-    ...(topW.length ? ["Top withdrawers:", ...topW, ""] : []),
-    ...(kindLine ? [`Types: ${kindLine}`, ""] : []),
-    ...(big.length ? ["Largest:", ...big, ""] : []),
-    `Guards: ${tokBad || contTrips ? "⚠️ " + (tokBad + " token / " + contTrips + " drain") : "all green ✅"} · conservation ${consOk ? "exact ✅" : "syncing"} · solvency ${sv && sv.allHold ? "hold ✅" : "—"}`,
-    `Every number decoded from the chain — no synthetic data.`,
-    `🔗 flash-flow-sentinel.vercel.app`,
+    `Outflow ${usd(sum(outEv))} (${outEv.length}) · Inflow ${usd(sum(inEv))} (${inEv.length}) · Net ${usd(sum(inEv) - sum(outEv))}`,
+    `Guards: ${tokBad || contTrips ? "⚠️ " + tokBad + " token / " + contTrips + " drain" : "all green ✅"} · conservation ${consOk ? "exact ✅" : "syncing"} · solvency ${sv && sv.allHold ? "hold ✅" : "—"}`,
   ].join("\n");
+  if (!evs.length) return [header + "\n\nNo transactions this hour.\n🔗 flash-flow-sentinel.vercel.app"];
+  // FULL list — EVERY transaction with its FULL wallet address + FULL solscan link (auto-links in Telegram)
+  const lines = evs.map((e) => {
+    const t = new Date(e.blockTime * 1000).toISOString().slice(11, 16);
+    const kind = classify(e.ix || [], e.direction) || (e.direction === "out" ? "OUT" : "IN");
+    const arrow = e.direction === "out" ? "🔴 OUT" : "🟢 IN ";
+    return `${t} ${arrow} ${usd(e.usd)} ${e.symbol || "?"} · ${kind}\n${e.wallet || "unknown"}\nhttps://solscan.io/tx/${e.sig}`;
+  });
+  // pack into ≤3900-char Telegram messages; header leads the first chunk
+  const chunks = []; let buf = header + "\n\n— all transactions —";
+  for (const ln of lines) {
+    if ((buf + "\n\n" + ln).length > 3900) { chunks.push(buf); buf = ln; }
+    else buf += "\n\n" + ln;
+  }
+  if (buf) chunks.push(buf);
+  const n = chunks.length;
+  return chunks.map((c, i) => c + (n > 1 ? `\n\n— part ${i + 1}/${n} —` : "") + (i === n - 1 ? "\n🔗 flash-flow-sentinel.vercel.app" : ""));
 }
 let hourlyBusy = false;
 async function maybeSendHourlySummary() {
@@ -362,8 +356,10 @@ async function maybeSendHourlySummary() {
   if (S.lastHourlySummary && now() - S.lastHourlySummary < HOURLY_SUMMARY_SEC) return;
   hourlyBusy = true;
   try {
-    const r = await sendSecurityAlert(composeHourlySummary()); // reliable private-DM channel (4× retry, confirmed delivery)
-    if (r) { S.lastHourlySummary = now(); saveState(); } // advance only on confirmed delivery, so a failed send retries next cycle
+    const chunks = composeHourlySummary(); // array of ≤4k-char messages (every tx, full addr + full link)
+    let allOk = true;
+    for (const ch of chunks) { const r = await sendSecurityAlert(ch); if (!r) allOk = false; await new Promise((res) => setTimeout(res, 1200)); } // pace to stay under Telegram limits
+    if (allOk) { S.lastHourlySummary = now(); saveState(); } // advance only if EVERY part delivered, else retry next cycle
   } catch (e) { S.cycleErrors.push("hourly: " + (e.message || e)); }
   finally { hourlyBusy = false; }
 }
