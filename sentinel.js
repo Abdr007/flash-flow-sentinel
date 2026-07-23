@@ -28,6 +28,7 @@ const { fetchFlashLazerPrices, fetchFlashLazerIds } = require("./lib/flashprices
 const { DEFAULT_LIMITS, evaluate, ruleStates, hourlyBucketsBySide } = require("./lib/limits.cjs");
 const { fetchGovernance, diffGovernance, mergeGovernance } = require("./lib/authority.cjs");
 const solvency = require("./lib/solvency.cjs");
+const quorum = require("./lib/quorum.cjs");
 const { deliverAlert, heartbeat, sendTelegram, sendOperator, sendSecurityAlert, sendWithdrawalNotice, sendOrEditLiveStatus, channelsConfigured } = require("./lib/notify.cjs");
 const containment = require("./lib/containment.cjs"); // Layer 3 — proof-gated auto-containment
 const reconwatch = require("./lib/reconwatch.cjs");
@@ -113,6 +114,7 @@ const S = {
   solvencyBuffer: { accum: 0, lastSurplus: null, lastAt: 0, alertAt: 0 }, // cross-domain unbacked-outflow watch (coarse USD aggregate; FALLBACK when per-custody data absent)
   custodyBacking: {},      // custody → { lastResidualHuman, lastAt, accumUsd } — PRECISE per-custody raw (mark-free) unbacked-outflow reconciliation; the deepest layer
   ownSolvency: { allSolvent: null, deficit: 0, backed: 0, custodyCount: 0, totalDeficitRaw: "0", complete: false, asOf: 0, defStreak: 0, disStreak: 0, defAlertAt: 0, disAlertAt: 0 }, // the sentinel's OWN independent solvency recompute (2nd witness) + cross-witness state
+  quorum: { facts: null, checkedAt: 0, streak: {}, alertAt: {} }, // cross-provider quorum on crown-jewel base-chain facts (stale/compromised-RPC guard; degradation-safe)
   sse: new Set(),
 };
 
@@ -154,13 +156,14 @@ function loadState() {
     S.solvencyBuffer = j.solvencyBuffer || { accum: 0, lastSurplus: null, lastAt: 0, alertAt: 0 };
     S.custodyBacking = j.custodyBacking || {};
     S.ownSolvency = j.ownSolvency || S.ownSolvency;
+    S.quorum = j.quorum || S.quorum;
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, knownSettlers: S.knownSettlers, settlerSeeded: S.settlerSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastHourlySummary: S.lastHourlySummary, custodyHighWater: S.custodyHighWater, driftAccum: S.driftAccum, driftAccumAt: S.driftAccumAt, solvencyBuffer: S.solvencyBuffer, custodyBacking: S.custodyBacking, ownSolvency: S.ownSolvency, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
+  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, knownSettlers: S.knownSettlers, settlerSeeded: S.settlerSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastHourlySummary: S.lastHourlySummary, custodyHighWater: S.custodyHighWater, driftAccum: S.driftAccum, driftAccumAt: S.driftAccumAt, solvencyBuffer: S.solvencyBuffer, custodyBacking: S.custodyBacking, ownSolvency: S.ownSolvency, quorum: { streak: S.quorum.streak, alertAt: S.quorum.alertAt }, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
   // ATOMIC write: a crash mid-write must never leave a half-written state file (which would wipe the sent-
   // history on reboot and re-send withdrawals). Write to a temp file, then rename — rename is atomic on the
   // volume's filesystem, so readers only ever see a complete file.
@@ -788,6 +791,57 @@ async function checkIndependentSolvency(inv, censusStale, t) {
   saveState();
 }
 
+// ---------------- cross-provider quorum (stale/compromised-RPC guard) ----------------
+// Reads the crown-jewel base-chain facts (upgrade authority, program-deploy slot, Squads multisig) from several
+// providers and alarms only if they PERSISTENTLY disagree — one RPC is stale, wrong, or compromised. Anchored by
+// the reliable MagicBlock endpoints (which also serve base-chain accounts), so rate-limited public RPCs dropping
+// out can't break it. HARD RULE: this can never stop production — it's a slow, isolated, fully-caught side check;
+// any/all provider failures degrade gracefully (status only, no alarm).
+const FLASH6_PROGRAMDATA = process.env.FLASH6_PROGRAMDATA || "8ta4NRHQxtYta4w1VqtW9mKDwrnS5F8wRcSJDKLTGjTi";
+const QUORUM_SQUADS_CFG = process.env.SQUADS_MULTISIG_ACCOUNT || "Gb33UeQNnQ4XDuobtGq9M6PVKRVfoH77p8d6JXsgqyXF";
+const QUORUM_PROVIDERS = (() => {
+  // reliable anchors first (MagicBlock endpoints proxy base-chain reads); env QUORUM_RPCS can add "name=url,..."
+  const def = [
+    { name: "primary", url: MAIN_URL },
+    { name: "magicblock", url: "https://rpc.magicblock.app/mainnet" },
+    { name: "flashtrade-er", url: ER_URL },
+  ];
+  const extra = (process.env.QUORUM_RPCS || "").split(",").map((s) => s.trim()).filter(Boolean).map((pair) => {
+    const [name, url] = pair.includes("=") ? pair.split("=") : [pair.replace(/^https?:\/\//, "").slice(0, 12), pair];
+    return { name, url };
+  });
+  // de-dup by url
+  const seen = new Set(); return [...def, ...extra].filter((p) => p.url && !seen.has(p.url) && seen.add(p.url));
+})();
+let quorumBusy = false;
+async function checkQuorum() {
+  if (quorumBusy) return; quorumBusy = true;
+  const t = now();
+  try {
+    const facts = await quorum.quorumCheck(QUORUM_PROVIDERS, { programData: FLASH6_PROGRAMDATA, squadsCfg: QUORUM_SQUADS_CFG }, 8000);
+    S.quorum.facts = facts; S.quorum.checkedAt = t;
+    for (const [k, f] of Object.entries(facts)) {
+      if (f.disagree) {
+        S.quorum.streak[k] = (S.quorum.streak[k] || 0) + 1;
+        // require 2 consecutive disagreeing rounds (~10min) so a one-off stale read can't false-alarm
+        if (S.quorum.streak[k] >= 2 && (!S.quorum.alertAt[k] || t - S.quorum.alertAt[k] > 3600)) {
+          const detail = f.readings.map((r) => `${r.provider}: ${r.value}`).join("\n");
+          log(`QUORUM DISAGREEMENT — ${f.label}: ${f.readings.map((r) => r.provider + "=" + r.value).join(", ")}`);
+          const delivered = !SECURITY_ALERTS() || await sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nRPC SOURCE DISAGREEMENT — ${f.label}\n\nIndependent RPC providers report DIFFERENT values for a crown-jewel fact:\n${detail}\n\n⚠️ One RPC is stale, wrong, or COMPROMISED (feeding a false view that could hide a change to the upgrade authority or governance multisig). Verify the true on-chain value NOW.\n\n🔗 flash-flow-sentinel.vercel.app`);
+          if (delivered) S.quorum.alertAt[k] = t;
+        }
+      } else {
+        // agree OR degraded (< 2 responders) → clear streak; degraded NEVER alarms
+        S.quorum.streak[k] = 0; S.quorum.alertAt[k] = 0;
+      }
+    }
+    saveState();
+  } catch (e) {
+    // even a total failure of the quorum check must not touch production — record and move on
+    S.cycleErrors.push("quorum: " + (e.message || e));
+  } finally { quorumBusy = false; }
+}
+
 // ---------------- reconciliation-anomaly watch (the 7-day-rehearsal catcher) ----------------
 // Poll the census basket-vs-market reconciliation and alert on the FIRST appearance of a phantom position
 // (a Market whose open-interest no longer matches the sum of the baskets behind it). A phantom is the
@@ -1338,10 +1392,11 @@ async function refreshIndependentPrices() {
   } catch (e) { S.cycleErrors.push("flashapi prices: " + e.message); }
 }
 
-let lastCustodyRefresh = 0, busy = false, lastGovCheck = 0, lastReconCheck = 0;
+let lastCustodyRefresh = 0, busy = false, lastGovCheck = 0, lastReconCheck = 0, lastQuorumCheck = 0;
 let cycleStartedAt = 0, cycleGen = 0, cycleWedges = 0; // watchdog: detect + force-recover a hung cycle
 const GOV_CHECK_MS = Number(process.env.GOV_CHECK_MS || 120000); // governance rarely changes; 5 RPCs
 const RECON_CHECK_MS = Number(process.env.RECON_CHECK_MS || 180000); // basket-vs-market reconciliation (1 census fetch)
+const QUORUM_CHECK_MS = Number(process.env.QUORUM_CHECK_MS || 300000); // crown-jewel cross-provider quorum; slow — facts change ~never
 // A cycle normally takes ~15s; even a 429-storm with RPC retries stays well under this. If `busy` is still
 // held past this ceiling, the cycle is wedged on an await that will never return (a monitor must NEVER be
 // able to stall permanently) — the watchdog force-releases the lock so the next poll tick runs a fresh cycle.
@@ -1375,6 +1430,8 @@ async function cycle(reason) {
     await refreshIndependentPrices();
     if (Date.now() - lastGovCheck > GOV_CHECK_MS) { await checkGovernance(); lastGovCheck = Date.now(); }
     if (Date.now() - lastReconCheck > RECON_CHECK_MS) { await checkReconciliation(); lastReconCheck = Date.now(); }
+    // cross-provider quorum: fire-and-forget on a slow cadence — fully isolated, cannot stop or slow the cycle.
+    if (Date.now() - lastQuorumCheck > QUORUM_CHECK_MS) { lastQuorumCheck = Date.now(); checkQuorum().catch((e) => S.cycleErrors.push("quorum: " + (e.message || e))); }
     S.events.sort((a, b) => a.blockTime - b.blockTime);
     pruneMemory();
     repriceEvents(); // value unpriced-at-ingest flows at the current mark so they count toward the caps
@@ -1508,6 +1565,8 @@ function snapshot() {
     // Layer 3 auto-containment posture + any proven-drain trips (proof-gated; sentinel holds no pause key by design).
     containment: { ...containment.posture(containment.cfg(), SECURITY_ALERTS()), lastTrip: S.containment.lastTrip, trips: Object.values(S.containment.trips).slice(-10).reverse() },
     governance: S.governance ? { ...S.governance, changes: S.govChanges.slice(-40).reverse(), authorizedUpgrades: S.authorizedUpgrades.slice(-20).reverse() } : null,
+    // cross-provider quorum on crown-jewel facts: per-fact agreement across independent RPCs (degradation-safe).
+    quorum: S.quorum.facts ? { checkedAt: S.quorum.checkedAt, providers: QUORUM_PROVIDERS.map((p) => p.name), facts: S.quorum.facts } : null,
     // settlement-signer watch: the authorized ER→base crank set (AFX compromised-signer tripwire). Any settlement
     // signed by a key outside this set fires a CRITICAL private alarm — auth-model-aware, unlike conservation/census.
     settlementWatch: { seeded: S.settlerSeeded, authorizedSettlers: Object.keys(S.knownSettlers), pinned: EXPECTED_SETTLERS.length > 0, watches: "ProcessUndelegation (ER→base commit)" },
