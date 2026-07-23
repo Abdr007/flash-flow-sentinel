@@ -711,6 +711,9 @@ function notifyWithdrawalSummary() {
 
 // Dispatcher — default mode posts the hourly summary above (no spam); WITHDRAWAL_MODE=pertx uses the
 // dedup-hardened per-transaction feed below. Every value is decoded live on-chain; nothing is ever synthetic.
+// Human-readable labels for the public feed (any kind not listed shows its raw kind unchanged).
+const KIND_LABEL = { REVENUE: "Collect Revenue" };
+const kindLabel = (k) => KIND_LABEL[k] || k;
 function notifyWithdrawals() {
   if (!WITHDRAWAL_ALERTS()) return;
   if (WMODE() === "summary") return notifyWithdrawalSummary();
@@ -751,7 +754,7 @@ function notifyWithdrawals() {
         const hdr = total === 1 ? "💸 WITHDRAWAL · Flash V2"
           : chunks.length === 1 ? `💸 ${total} WITHDRAWALS · Flash V2`
           : `💸 Flash V2 withdrawals (${c * CHUNK + 1}–${c * CHUNK + part.length} of ${total})`;
-        const body = part.map((e) => `• ${amtStr(e)} (${e.pool}) → ${short(e.wallet)} · ${e.kind}\n  https://solscan.io/tx/${e.sig}`).join("\n");
+        const body = part.map((e) => `• ${amtStr(e)} (${e.pool}) → ${short(e.wallet)} · ${kindLabel(e.kind)}\n  https://solscan.io/tx/${e.sig}`).join("\n");
         const ok = await sendWithdrawalNotice(`${hdr}\n\n${body}`);
         if (!ok) log(`WITHDRAWAL notice FAILED to deliver (${part.length}): ${part.map((e) => e.sig.slice(0, 10)).join(", ")} — already marked sent, will NOT re-send (resend manually if needed)`);
         if (c < chunks.length - 1) await new Promise((r) => setTimeout(r, 1100));
