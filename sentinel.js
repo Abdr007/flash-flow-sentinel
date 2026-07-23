@@ -1809,6 +1809,25 @@ const server = http.createServer((req, res) => {
     try { S.cycleErrors.unshift(`watchdog: force-reset a cycle wedged ${stuckS}s`); } catch (e) {}
     sendOperator(`⚠️ FLASH FLOW SENTINEL — watchdog recovered a wedged monitor cycle (hung ${stuckS}s on a network call, likely RPC). Lock force-released; monitoring is resuming automatically. Wedge #${cycleWedges}. Dashboard: flash-flow-sentinel.vercel.app`);
   }, WATCHDOG_TICK_MS);
+
+  // KEEP-ALIVE — on a free host (Render/Railway) the instance spins down after ~15 min with no inbound HTTP
+  // traffic. A closed laptop / no open dashboard tab = no traffic = the whole monitor sleeps, and the next
+  // visitor hits a cold start (the "app is down" symptom). A light self-ping to our own public URL keeps
+  // inbound traffic flowing so the sentinel never idles out. No-op locally (no public URL). Render injects
+  // RENDER_EXTERNAL_URL automatically; override with KEEPALIVE_URL / KEEPALIVE_MS if needed.
+  const KEEPALIVE_URL = process.env.KEEPALIVE_URL || process.env.RENDER_EXTERNAL_URL;
+  if (KEEPALIVE_URL && typeof fetch === "function") {
+    const kaTarget = KEEPALIVE_URL.replace(/\/+$/, "") + "/";
+    const KEEPALIVE_MS = Math.max(60000, Number(process.env.KEEPALIVE_MS || 10 * 60 * 1000)); // default 10m, under the ~15m idle threshold
+    log(`keep-alive: self-ping ${kaTarget} every ${Math.round(KEEPALIVE_MS / 1000)}s (anti-spindown)`);
+    setInterval(() => {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 15000);
+      fetch(kaTarget, { method: "GET", signal: ctl.signal, headers: { "user-agent": "flash-flow-sentinel-keepalive" } })
+        .catch((e) => log(`keep-alive ping failed: ${e && e.message ? e.message : e}`))
+        .finally(() => clearTimeout(t));
+    }, KEEPALIVE_MS);
+  }
 })().catch((e) => { console.error("FATAL:", e); process.exit(1); });
 
 process.on("SIGINT", () => { try { saveState(); } catch (e) {} process.exit(0); });
