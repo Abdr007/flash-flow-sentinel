@@ -106,7 +106,7 @@ function renderVerdict(S) {
   const oraBad = ev.oracle.filter((o) => o.status === "breach").length, oraWarn = ev.oracle.filter((o) => o.status === "warn").length;
   const worstDev = oraRows.length ? oraRows[0] : null;
   const cons = S.conservation, cn = cons.rows.length, cx = cons.rows.filter((r) => r.status === "exact").length;
-  const capOk = S.meta.lastCycle && (stalenessAge(S.meta) || 0) < 90;
+  const capOk = S.meta.lastCycle && (stalenessAge(S.meta) || 0) < ((S.meta && S.meta.staleCutoffSec) || 90); // adaptive cutoff (matches the hero) — a slow-but-healthy backfill cycle no longer false-reds CAPTURE
   const govBad = (S.governance && (S.governance.changes || []).length) || 0;
   const cm = S.containment || {}; const contTrips = (cm.trips || []).length; // Layer 3: proven-drain auto-containment trips
   const govStale = !!(S.governance && S.governance.staleSections && S.governance.staleSections.length); // a critical section read failed (e.g. ER outage)
