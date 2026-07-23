@@ -27,6 +27,7 @@ const { fetchLazerMeta, fetchLazerLatest } = require("./lib/lazer.cjs");
 const { fetchFlashLazerPrices, fetchFlashLazerIds } = require("./lib/flashprices.cjs");
 const { DEFAULT_LIMITS, evaluate, ruleStates, hourlyBucketsBySide } = require("./lib/limits.cjs");
 const { fetchGovernance, diffGovernance, mergeGovernance } = require("./lib/authority.cjs");
+const solvency = require("./lib/solvency.cjs");
 const { deliverAlert, heartbeat, sendTelegram, sendOperator, sendSecurityAlert, sendWithdrawalNotice, sendOrEditLiveStatus, channelsConfigured } = require("./lib/notify.cjs");
 const containment = require("./lib/containment.cjs"); // Layer 3 — proof-gated auto-containment
 const reconwatch = require("./lib/reconwatch.cjs");
@@ -111,6 +112,7 @@ const S = {
   driftAccumAt: 0,         // watermark blockTime up to which drift has been accumulated
   solvencyBuffer: { accum: 0, lastSurplus: null, lastAt: 0, alertAt: 0 }, // cross-domain unbacked-outflow watch (coarse USD aggregate; FALLBACK when per-custody data absent)
   custodyBacking: {},      // custody → { lastResidualHuman, lastAt, accumUsd } — PRECISE per-custody raw (mark-free) unbacked-outflow reconciliation; the deepest layer
+  ownSolvency: { allSolvent: null, deficit: 0, backed: 0, custodyCount: 0, totalDeficitRaw: "0", complete: false, asOf: 0, defStreak: 0, disStreak: 0, defAlertAt: 0, disAlertAt: 0 }, // the sentinel's OWN independent solvency recompute (2nd witness) + cross-witness state
   sse: new Set(),
 };
 
@@ -151,13 +153,14 @@ function loadState() {
     S.driftAccumAt = j.driftAccumAt || 0;
     S.solvencyBuffer = j.solvencyBuffer || { accum: 0, lastSurplus: null, lastAt: 0, alertAt: 0 };
     S.custodyBacking = j.custodyBacking || {};
+    S.ownSolvency = j.ownSolvency || S.ownSolvency;
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, knownSettlers: S.knownSettlers, settlerSeeded: S.settlerSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastHourlySummary: S.lastHourlySummary, custodyHighWater: S.custodyHighWater, driftAccum: S.driftAccum, driftAccumAt: S.driftAccumAt, solvencyBuffer: S.solvencyBuffer, custodyBacking: S.custodyBacking, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
+  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, knownSettlers: S.knownSettlers, settlerSeeded: S.settlerSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastHourlySummary: S.lastHourlySummary, custodyHighWater: S.custodyHighWater, driftAccum: S.driftAccum, driftAccumAt: S.driftAccumAt, solvencyBuffer: S.solvencyBuffer, custodyBacking: S.custodyBacking, ownSolvency: S.ownSolvency, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
   // ATOMIC write: a crash mid-write must never leave a half-written state file (which would wipe the sent-
   // history on reboot and re-send withdrawals). Write to a temp file, then rename — rename is atomic on the
   // volume's filesystem, so readers only ever see a complete file.
@@ -743,6 +746,48 @@ async function checkSolvencyBuffer(inv, t, silent) {
   saveState();
 }
 
+// ---------------- independent solvency recompute (the sentinel's OWN second witness) ----------------
+// The sentinel scans the ER and recomputes per-custody solvency ITSELF (lib/solvency.cjs), so it no longer
+// only trusts the census. Two alarms: (1) an INDEPENDENT deficit — a real insolvency proven without the census;
+// (2) a WITNESS DISAGREEMENT — the sentinel's own compute and the census disagree on solvency, meaning one
+// source is wrong/stale/compromised (a census hacked to show "solvent" during a drain can no longer hide it).
+// Both require a 2-check streak so a mid-settlement slot-skew blip between the two scans can't false-alarm.
+async function checkIndependentSolvency(inv, censusStale, t) {
+  const O = S.ownSolvency;
+  let own;
+  try { own = await solvency.computeSolvency(er, main); }
+  catch (e) { S.cycleErrors.push("ownsolv: " + (e.message || e)); return; } // witness unavailable this pass — never read as solvent
+  // store the summary for the dashboard + persistence (keep streak/alert bookkeeping)
+  Object.assign(O, { allSolvent: own.allSolvent, deficit: own.deficit, backed: own.backed, custodyCount: own.custodyCount, totalDeficitRaw: own.totalDeficitRaw, complete: own.complete, asOf: t });
+
+  // (1) INDEPENDENT DEFICIT — proven by the sentinel's own scan, no census involved. 2-check streak.
+  if (own.complete && own.deficit > 0) {
+    O.defStreak = (O.defStreak || 0) + 1;
+    if (O.defStreak >= 2 && (!O.defAlertAt || t - O.defAlertAt > 1800)) {
+      const top = own.deficitRows.slice(0, 5).map((r) => `• ${r.mint.slice(0, 6)}…: -${(Number(r.deficitRaw) / Math.pow(10, r.decimals)).toFixed(4)} · vault ${r.vault.slice(0, 6)}…`).join("\n");
+      log(`OWN-SOLVENCY CRITICAL — independent scan shows ${own.deficit} custody deficit(s)`);
+      const delivered = !SECURITY_ALERTS() || await sendSecurityAlert(`🔴🔴 SECURITY · FLASH V2 🔴🔴\n━━━━━━━━━━━━━━━━━━━━\nINDEPENDENT SOLVENCY DEFICIT\n\nThe sentinel's OWN on-chain recompute (raw u64, ER scan, no census API) proves ${own.deficit} custody(ies) are under-collateralised — vault balance + receivable < owned + payable:\n${top}\n\n⚠️ This is an INDEPENDENT proof of insolvency — it does not depend on the census being up or honest. ACT NOW.\n\n🔗 flashtrade-v2-onchain-census.vercel.app`);
+      if (delivered) O.defAlertAt = t;
+    }
+  } else { O.defStreak = 0; if (own.allSolvent) O.defAlertAt = 0; }
+
+  // (2) CROSS-WITNESS DISAGREEMENT — the two independent computes disagree on solvency. Only when BOTH are
+  // present, complete, and the census is fresh (a stale census isn't a disagreement, it's just old). 2-check streak.
+  const censusPresent = inv && inv.present && !censusStale;
+  const censusSolvent = !!(inv && inv.allHold && (inv.deficit == null || Number(inv.deficit) === 0));
+  if (own.complete && censusPresent) {
+    if (own.allSolvent !== censusSolvent) {
+      O.disStreak = (O.disStreak || 0) + 1;
+      if (O.disStreak >= 2 && (!O.disAlertAt || t - O.disAlertAt > 1800)) {
+        log(`WITNESS DISAGREEMENT — own.allSolvent=${own.allSolvent} census.solvent=${censusSolvent}`);
+        const delivered = !SECURITY_ALERTS() || await sendSecurityAlert(`🔴🔴 SECURITY · FLASH V2 🔴🔴\n━━━━━━━━━━━━━━━━━━━━\nWITNESS DISAGREEMENT\n\nThe two independent solvency witnesses DISAGREE:\n• sentinel's own ER recompute → ${own.allSolvent ? "SOLVENT" : `DEFICIT (${own.deficit})`}\n• census invariants → ${censusSolvent ? "SOLVENT" : "NOT solvent"}\n\n⚠️ One source is wrong, stale, or COMPROMISED. A monitor whose two witnesses always agreed could be fooled by tampering with one; this catches exactly that. Investigate which is lying NOW.\n\n🔗 flashtrade-v2-onchain-census.vercel.app`);
+        if (delivered) O.disAlertAt = t;
+      }
+    } else { O.disStreak = 0; O.disAlertAt = 0; }
+  }
+  saveState();
+}
+
 // ---------------- reconciliation-anomaly watch (the 7-day-rehearsal catcher) ----------------
 // Poll the census basket-vs-market reconciliation and alert on the FIRST appearance of a phantom position
 // (a Market whose open-interest no longer matches the sum of the baskets behind it). A phantom is the
@@ -777,7 +822,10 @@ async function checkReconciliation() {
   S.reconStatus = { mismatched: recon.mismatchedCount, marketSides: recon.marketSides, allExact: recon.allExact, checkedAt: t,
     solvency: { present: inv.present, allHold: inv.allHold, fails: inv.fails, asOfUnix: inv.asOfUnix, stale, coveragePct: inv.coveragePct, deficit: inv.deficit,
       surplusUsd: inv.surplusUsd, vaultUsd: inv.vaultUsd, ownedUsd: inv.ownedUsd, unbackedAccum: S.solvencyBuffer.accum,
-      perCustodyUnbacked: Object.entries(S.custodyBacking).filter(([, v]) => v && v.accumUsd > 1).map(([c, v]) => ({ custody: c, unbackedUsd: Math.round(v.accumUsd) })) } };
+      perCustodyUnbacked: Object.entries(S.custodyBacking).filter(([, v]) => v && v.accumUsd > 1).map(([c, v]) => ({ custody: c, unbackedUsd: Math.round(v.accumUsd) })),
+      // the sentinel's OWN independent recompute (2nd witness) + whether it agrees with the census
+      independent: { allSolvent: S.ownSolvency.allSolvent, deficit: S.ownSolvency.deficit, backed: S.ownSolvency.backed, custodyCount: S.ownSolvency.custodyCount, complete: S.ownSolvency.complete, asOf: S.ownSolvency.asOf,
+        agreesWithCensus: S.ownSolvency.allSolvent == null ? null : (S.ownSolvency.allSolvent === (inv.allHold && (inv.deficit == null || Number(inv.deficit) === 0))) } } };
 
   // ---- PROTOCOL SOLVENCY INVARIANTS (the single strongest signal) ----
   // If the census's own on-chain invariants FAIL, the protocol is provably insolvent / being drained. CRITICAL,
@@ -803,6 +851,8 @@ async function checkReconciliation() {
       const ranPrecise = await checkCustodyBacking(full.backing, inv, t);
       await checkSolvencyBuffer(inv, t, /*silent=*/ ranPrecise);
     } catch (e) { S.cycleErrors.push("solvbuffer: " + (e.message || e)); }
+    // independent second witness: the sentinel recomputes solvency itself and cross-checks the census.
+    try { await checkIndependentSolvency(inv, stale, t); } catch (e) { S.cycleErrors.push("ownsolv: " + (e.message || e)); }
   }
 
   // Cold start: silently baseline whatever phantom mismatch already exists so a pre-existing one is never fired
