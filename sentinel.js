@@ -86,6 +86,8 @@ const S = {
   wFreshToken: null,         // last WITHDRAWAL_FRESH_START value applied
   knownPrograms: {},         // programId → firstSeen — every program ever seen touching Flash vaults (new-program detector)
   progSeeded: false,         // once true, the existing program set is baselined; only NEW programs alert
+  knownSettlers: {},         // signer → firstSeen — authorized ER→base settlement crank(s) (ProcessUndelegation). ANY new settler = the AFX compromised-signer fingerprint (auth-model-aware; conservation/census are auth-agnostic and can't raise this).
+  settlerSeeded: false,      // once true, the authorized settler set is baselined; only a NEW settler alarms
   probeFunders: {},          // probe wallet → funding source (in-memory cache; re-traced on restart, only runs when a cluster exists)
   probeClusterKey: null,     // latch: last-alerted coordinated-cluster signature (funder:count) so a proven cluster alarms once
   containment: { trips: {}, lastTrip: null, checked: {} }, // Layer 3: proven-drain trips (persisted) + in-memory verify cache
@@ -136,6 +138,8 @@ function loadState() {
     S.wSummaryLast = j.wSummaryLast || 0;
     S.knownPrograms = j.knownPrograms || {};
     S.progSeeded = !!j.progSeeded;
+    S.knownSettlers = j.knownSettlers || {};
+    S.settlerSeeded = !!j.settlerSeeded;
     S.probeClusterKey = j.probeClusterKey || null;
     S.containment = { trips: (j.containment && j.containment.trips) || {}, lastTrip: (j.containment && j.containment.lastTrip) || null, checked: {} };
     S.liveStatusMsgId = j.liveStatusMsgId || null;
@@ -149,7 +153,7 @@ function loadState() {
   } catch (e) {}
 }
 function saveState() {
-  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastHourlySummary: S.lastHourlySummary, custodyHighWater: S.custodyHighWater, driftAccum: S.driftAccum, driftAccumAt: S.driftAccumAt, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
+  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, knownSettlers: S.knownSettlers, settlerSeeded: S.settlerSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastHourlySummary: S.lastHourlySummary, custodyHighWater: S.custodyHighWater, driftAccum: S.driftAccum, driftAccumAt: S.driftAccumAt, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
   // ATOMIC write: a crash mid-write must never leave a half-written state file (which would wipe the sent-
   // history on reboot and re-send withdrawals). Write to a temp file, then rename — rename is atomic on the
   // volume's filesystem, so readers only ever see a complete file.
@@ -873,6 +877,66 @@ async function checkNewPrograms() {
   } finally { newProgBusy = false; }
 }
 
+// ---------------- settlement-signer watch (the AFX compromised-signer catcher) ----------------
+// AFX ($24M, 2026-07-22) was drained by a COMPROMISED SIGNER on the settlement/bridge path: the withdrawals
+// carried GENUINE, valid signatures satisfying the quorum — the bridge released funds because the auth checked
+// out, even though the controller was the attacker. Signature-checks, audits and Pyth verification are all
+// blind to this: the auth is real. Conservation + census catch the RESULTING drop (they're auth-agnostic), but
+// they cannot tell you WHO signed it. This watch closes that exact gap.
+//
+// Flash's ER→base settlement (`ProcessUndelegation`, the MagicBlock delegation-program commit that releases a
+// delegated vault back to base chain) is — verified on-chain — executed by a single fixed crank signer
+// (FLAshCJG…). A user can NEVER self-sign it (the vault is a program-owned PDA committed through the delegation
+// program), so the authorized settler set is small, fixed, and pinnable. ANY settlement signed by a key outside
+// that set is the on-chain fingerprint of a stolen/forged settler — a CRITICAL, auth-model-aware signal.
+// Proven-only, delivery-confirmed, private DM. Optionally pin the set with EXPECTED_SETTLEMENT_SIGNERS=key1,key2.
+const SETTLE_IX = /ProcessUndelegation/i; // structurally crank-only (verified: 1 distinct signer across sampled vaults)
+const EXPECTED_SETTLERS = (process.env.EXPECTED_SETTLEMENT_SIGNERS || "").split(",").map((s) => s.trim()).filter(Boolean);
+let settleBusy = false;
+async function checkSettlementSigners() {
+  if (!SECURITY_ALERTS() || settleBusy) return;
+  // every distinct signer of a settlement instruction in the retained buffer → a representative sample event
+  const settlers = {};
+  for (const e of S.events) {
+    if (!Array.isArray(e.ix) || !e.ix.some((n) => SETTLE_IX.test(n))) continue;
+    const signer = e.feePayer || e.wallet; // keys[0] = the settlement signer (verified)
+    if (!signer) continue;
+    if (!settlers[signer]) settlers[signer] = e;
+  }
+  const seen = Object.keys(settlers);
+  if (!seen.length) return;
+  // SEED: pin to EXPECTED_SETTLEMENT_SIGNERS if the operator supplied them (then even a first-pass rogue signer
+  // alarms); otherwise baseline whatever legit crank(s) the buffer currently shows. Rigorous either way.
+  if (!S.settlerSeeded) {
+    const base = EXPECTED_SETTLERS.length ? EXPECTED_SETTLERS : seen;
+    for (const s of base) if (!S.knownSettlers[s]) S.knownSettlers[s] = now();
+    S.settlerSeeded = true; saveState();
+    log(`SETTLEMENT-SIGNER watch seeded: ${Object.keys(S.knownSettlers).length} authorized settler(s)${EXPECTED_SETTLERS.length ? " (pinned via env)" : " (observed)"} [${Object.keys(S.knownSettlers).map((x) => x.slice(0, 4) + "…").join(", ")}]`);
+    if (!EXPECTED_SETTLERS.length) return; // observed-seed trusts the buffer; skip alarms this pass
+    // pinned-seed: fall through so any observed signer NOT in the pinned set alarms immediately
+  }
+  const fresh = seen.filter((s) => !S.knownSettlers[s]);
+  if (!fresh.length) return;
+  settleBusy = true;
+  try {
+    for (const s of fresh) {
+      const ev = settlers[s];
+      const sv = S.reconStatus && S.reconStatus.solvency;
+      const censusSolvent = !!(sv && sv.present && sv.allHold && !sv.stale);
+      // total value this key has settled out inside the retained window — the blast size if it's compromised
+      const vol = S.events.filter((e) => (e.feePayer === s || e.wallet === s) && Array.isArray(e.ix) && e.ix.some((n) => SETTLE_IX.test(n)) && e.direction === "out").reduce((a, e) => a + (e.usd || 0), 0);
+      const known = Object.keys(S.knownSettlers).map((x) => x.slice(0, 4) + "…" + x.slice(-4)).join(", ") || "—";
+      const txt = `🔴🔴 SECURITY · FLASH V2 🔴🔴\n━━━━━━━━━━━━━━━━━━━━\nUNRECOGNISED SETTLEMENT SIGNER\n\nA key NEVER seen before just executed an ER→base settlement (ProcessUndelegation) on a Flash vault:\n${s}\nout-settled this window: $${Math.round(vol).toLocaleString()}\ne.g. ${ev.pool}/${ev.symbol} · https://solscan.io/tx/${ev.sig}\n\nAuthorized settler(s): ${known}\n\n${censusSolvent
+        ? "The independent census still shows solvency (deficit 0) — this could be an authorized crank rotation, but a NEW settlement authority is the EXACT fingerprint of the AFX compromised-signer drain ($24M, valid signatures). VERIFY this key is authorized NOW; if not, freeze the settlement authority."
+        : "🔴 The census does NOT confirm solvency — an unrecognised settler + a deficit is a LIVE compromised-signer drain. ACT NOW."}\n\n🔗 flash-flow-sentinel.vercel.app`;
+      const delivered = await sendSecurityAlert(txt);
+      // un-missable: baseline ONLY after confirmed delivery, so an undelivered alarm re-fires next cycle.
+      if (delivered) { S.knownSettlers[s] = now(); saveState(); }
+      log(`🔴 SETTLEMENT-SIGNER: unrecognised settler ${s.slice(0, 6)}… vol=$${Math.round(vol)} censusSolvent=${censusSolvent} delivered=${delivered}`);
+    }
+  } finally { settleBusy = false; }
+}
+
 let probeBusy = false;
 const PROBE_FRESH_TX_MAX = Number(process.env.PROBE_FRESH_TX_MAX || 50); // a disposable rehearsal wallet has few lifetime txs
 // Trace a wallet's on-chain ORIGIN: its lifetime tx count (freshness) + FUNDER (the account that sent it the most
@@ -1152,6 +1216,7 @@ async function cycle(reason) {
     repriceEvents(); // value unpriced-at-ingest flows at the current mark so they count toward the caps
     try { notifyWithdrawals(); } catch (e) { S.cycleErrors.push("wnotify: " + e.message); } // never let the firehose break the cycle
     try { checkNewPrograms(); } catch (e) { S.cycleErrors.push("newprog: " + e.message); } // new-program detector (rehearsal footprint)
+    checkSettlementSigners().catch((e) => S.cycleErrors.push("settler: " + (e.message || e))); // AFX compromised-signer watch on the ER→base settlement path
     const ev = evaluate(now(), S.events, S.failures, allDescriptors(), S.balances, S.marks, S.markTimes, S.lazerMarks || {}, S.pyth, S.limits, S.authority);
     processAlertTransitions(ev);
     checkProbeCluster(ev).catch((e) => S.cycleErrors.push("probe: " + (e.message || e))); // proven-only coordinated-cluster (common-funder) verify → DM
@@ -1279,6 +1344,9 @@ function snapshot() {
     // Layer 3 auto-containment posture + any proven-drain trips (proof-gated; sentinel holds no pause key by design).
     containment: { ...containment.posture(containment.cfg(), SECURITY_ALERTS()), lastTrip: S.containment.lastTrip, trips: Object.values(S.containment.trips).slice(-10).reverse() },
     governance: S.governance ? { ...S.governance, changes: S.govChanges.slice(-40).reverse(), authorizedUpgrades: S.authorizedUpgrades.slice(-20).reverse() } : null,
+    // settlement-signer watch: the authorized ER→base crank set (AFX compromised-signer tripwire). Any settlement
+    // signed by a key outside this set fires a CRITICAL private alarm — auth-model-aware, unlike conservation/census.
+    settlementWatch: { seeded: S.settlerSeeded, authorizedSettlers: Object.keys(S.knownSettlers), pinned: EXPECTED_SETTLERS.length > 0, watches: "ProcessUndelegation (ER→base commit)" },
     alerts: redactWatchedAlerts(S.alertsActive, S.alertsLog.slice(-100).reverse()),
     events: S.events.slice(-250).reverse().map((e) => ({ ...e, kind: classify(e.ix || [], e.direction), internal: !!(S.authority && e.wallet === S.authority) })),
     failures1h: S.failures.filter((f) => f.blockTime >= now() - 3600).length,
