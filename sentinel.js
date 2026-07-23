@@ -561,21 +561,32 @@ function checkConservation() {
       if (c.streak <= 2) c.status = "syncing"; // a transfer can land between the sig scan and the balance read
       else {
         c.status = "drift";
-        // A transfer that lands between a vault's signature scan and the balance read produces a
-        // transient residual right after startup that is NOT a missed transfer. Suppress the alert
-        // during the settle window (measured from when the vault was FIRST baselined, not from the last
-        // rebase — so a genuine persistent miss on a settled vault still re-alerts every ~3 cycles).
         if (c.firstSeen == null) c.firstSeen = c.baseTime || t;
-        const settled = t - c.firstSeen > 180;
+        // Suppress transient residuals: a transfer landing between the sig scan and the balance read, or a slow
+        // 0.1-CPU backfill cycle, produces a residual that is NOT a missed transfer. Only proceed once the vault
+        // has settled (180s), the monitor is READY, and it's running a NORMAL-speed cycle (not the slow backfill).
+        const settled = t - c.firstSeen > 180 && S.ready && (S.cycleSeconds || 0) < 60;
         if (settled) {
           const a = { time: t, rule: `conservation:${cust.pool}/${cust.symbol}`, from: "exact", to: "drift", detail: `residual ${residual} raw — rebasing baseline` };
           S.alertsLog.push(a); appendAlert(a); fireWebhook({ source: "flash-flow-sentinel", ...a });
           if (SECURITY_ALERTS()) {
             const tokAmt = Number(residual) / Math.pow(10, cust.decimals || 0), mk = S.marks[cust.custody];
             const usd = mk != null && Number.isFinite(tokAmt) ? ` (~$${Math.abs(tokAmt * mk).toLocaleString("en-US", { maximumFractionDigits: 0 })})` : "";
-            sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nCONSERVATION DRIFT\n\nVault ${cust.pool}/${cust.symbol} no longer reconciles:\nbaseline + Σ transfers ≠ live balance\nresidual ${tokAmt >= 0 ? "+" : "−"}${Math.abs(tokAmt).toFixed(4)} ${cust.symbol}${usd}\n\n⚠️ A transfer was missed or forged — investigate immediately.`);
+            // DUAL-WITNESS SEVERITY: a residual means the sentinel's OWN books don't tie out — but that's a DRAIN
+            // only if the INDEPENDENT census ALSO shows a deficit. If the census confirms full solvency, this is a
+            // monitor decode-gap (a tx the decoder couldn't parse), NOT a drain → send an informational note, never
+            // the "missed or forged — investigate now" critical. Only a census deficit (or no census) escalates.
+            const sv = S.reconStatus && S.reconStatus.solvency;
+            const censusSolvent = !!(sv && sv.present && sv.allHold && !sv.stale);
+            const skipped = (S.skippedSigs || []).length;
+            const amt = `${tokAmt >= 0 ? "+" : "−"}${Math.abs(tokAmt).toFixed(4)} ${cust.symbol}${usd}`;
+            if (censusSolvent) {
+              sendSecurityAlert(`🟡  MONITOR · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nCONSERVATION DECODE-GAP (NOT a drain)\n\nThe monitor's books drifted on ${cust.pool}/${cust.symbol} by ${amt}${skipped ? ` — ${skipped} tx the decoder couldn't parse` : ""}.\n\n✅ The INDEPENDENT census confirms FULL solvency (deficit 0) — no funds are missing. This is a monitor decode-gap; auto-rebasing. No action needed.`);
+            } else {
+              sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nCONSERVATION DRIFT\n\nVault ${cust.pool}/${cust.symbol} no longer reconciles:\nbaseline + Σ transfers ≠ live balance\nresidual ${amt}\n\n⚠️ The independent census does NOT confirm solvency (${sv && sv.present ? "deficit/failed" : "census unavailable"}) — a transfer may have been missed or forged. INVESTIGATE NOW.\n\n🔗 flash-flow-sentinel.vercel.app`);
+            }
           }
-          log(`CONSERVATION DRIFT ${cust.pool}/${cust.symbol} residual=${residual}`);
+          log(`CONSERVATION DRIFT ${cust.pool}/${cust.symbol} residual=${residual} censusSolvent=${!!(S.reconStatus && S.reconStatus.solvency && S.reconStatus.solvency.allHold)}`);
         }
         c.baseRaw = bal.toString(); c.baseTime = t; c.sumDeltas = "0"; c.streak = 0; c.rebases++;
       }
@@ -846,8 +857,17 @@ async function checkNewPrograms() {
       if (verdict !== "fresh") { log(`new program ${p} — ${verdict}${ageDays != null ? ` (~${ageDays.toFixed(0)}d old)` : ""} — baselined silently, not an attack footprint`); continue; }
       const evs = S.events.filter((e) => Array.isArray(e.programs) && e.programs.includes(p));
       const sample = evs[evs.length - 1];
-      log(`🔴 FRESHLY-DEPLOYED program touching Flash: ${p} (~${ageDays.toFixed(0)}d old)`);
-      sendSecurityAlert(`🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nFRESH PROGRAM TOUCHING FLASH\n\nA program deployed only ~${ageDays.toFixed(0)} days ago is interacting with Flash vaults:\n${p}\n${sample ? `\ne.g. ${sample.pool}/${sample.symbol} · https://solscan.io/tx/${sample.sig}` : ""}\n\n⚠️ PROVEN on-chain: a freshly-deployed program touching vaults is the exact attacker footprint (they deploy days before a drain). Investigate now.`);
+      const outN = evs.filter((e) => e.direction === "out").length, inN = evs.filter((e) => e.direction === "in").length;
+      // DUAL-WITNESS: a fresh program touching vaults is worth verifying, but it's a DRAIN only if the independent
+      // census also shows a deficit. If the census confirms solvency, frame it as "verify this integration", not
+      // "attacker — investigate now" (a legit new deposit/withdrawal router looks exactly like this).
+      const sv = S.reconStatus && S.reconStatus.solvency;
+      const censusSolvent = !!(sv && sv.present && sv.allHold && !sv.stale);
+      log(`🔴 FRESHLY-DEPLOYED program touching Flash: ${p} (~${ageDays.toFixed(0)}d) out=${outN} in=${inN} censusSolvent=${censusSolvent}`);
+      const ctx = censusSolvent
+        ? "✅ The independent census confirms FULL solvency (deficit 0) — NO drain is in progress. Verify this is a legitimate integration when convenient."
+        : (sv && sv.present ? "🔴 The census does NOT confirm solvency — a fresh program + a deficit is the real attacker pattern. INVESTIGATE NOW." : "The census cross-check is currently unavailable — verify soon.");
+      sendSecurityAlert(`${censusSolvent ? "🟠" : "🔴"}  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nNEW PROGRAM TOUCHING FLASH\n\nA program deployed ~${ageDays.toFixed(0)} day(s) ago is interacting with Flash vaults:\n${p}\n(activity: ${inN} deposit-side · ${outN} withdraw-side)\n${sample ? `e.g. ${sample.pool}/${sample.symbol} · https://solscan.io/tx/${sample.sig}\n` : ""}\n${ctx}`);
     }
     saveState();
   } finally { newProgBusy = false; }
