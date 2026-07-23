@@ -377,11 +377,16 @@ function renderGovernance(S) {
   const squads = ctrl.model === "squads-multisig";
   const ctrlBadge = squads ? ` <span class="gpill ok" title="program upgrades are executed through the Squads multisig program (${esc(ctrl.executor || "")}) — verified from the most recent on-chain upgrade transaction">🔐 SQUADS MULTISIG</span>`
     : ctrl.model === "direct-authority" ? ` <span class="gpill mut" title="the most recent upgrade was signed directly by the authority key, not via a detected multisig program">direct-authority</span>` : "";
-  const mofn = (S.meta && S.meta.squadsMofN) || "3-of-7";
+  // prefer the LIVE on-chain-decoded Squads config threshold over the operator-set env constant, so the
+  // displayed M-of-N is verified from chain (and the watch alarms if it ever changes) — never a stale label.
+  const sq = g.squadsMultisig;
+  const mofnDecoded = sq && sq.threshold != null && sq.registered != null ? `${sq.threshold}-of-${sq.registered}` : null;
+  const mofn = mofnDecoded || (S.meta && S.meta.squadsMofN) || "3-of-7";
+  const mofnSub = mofnDecoded ? `Squads ${esc(mofn)} — decoded on-chain, watched` : `Squads ${esc(mofn)} — verify on the Squads app`;
   const stat = (label, val, sub, cls) => `<div class="recon-stat ${cls || ""}"><span class="recon-stat-label">${label}</span><span class="recon-stat-value">${val}</span><span class="recon-stat-sub">${sub}</span></div>`;
   $("govSummary").innerHTML = [
     stat("UPGRADE AUTHORITY", acct(g.upgradeAuthority) + ctrlBadge, squads ? "program upgrades gated by the Squads multisig" : "program upgrade authority", squads ? "green" : ""),
-    stat("GOVERNANCE MULTISIG", squads ? `${esc(mofn)}` : "—", squads ? "Squads " + esc(mofn) + " — verify on the Squads app" : "not detected", squads ? "green" : ""),
+    stat("GOVERNANCE MULTISIG", squads ? `${esc(mofn)}` : "—", squads ? mofnSub : "not detected", squads ? "green" : ""),
     stat("PROGRAM DEPLOY", `slot ${g.lastDeploySlot != null ? g.lastDeploySlot.toLocaleString("en-US") : "—"}`, "last on-chain deploy — alerts on any redeploy", ""),
     stat("CHANGES SINCE BASELINE", String(changes), changes ? "see alert log" : "authority surface unchanged", changes ? "red" : "green"),
   ].join("");
