@@ -109,6 +109,7 @@ const S = {
   custodyHighWater: 0,     // most vaults ever seen in one scan (persisted → a flaky boot can't lower the bar; coverage-shrink guard)
   driftAccum: {},          // wallet → cumulative net outflow USD, persisted ACROSS event pruning — slow-drip nominator for the proof
   driftAccumAt: 0,         // watermark blockTime up to which drift has been accumulated
+  solvencyBuffer: { accum: 0, lastSurplus: null, lastAt: 0, alertAt: 0 }, // cross-domain unbacked-outflow watch: census surplus erosion PAIRED with base outflow (AFX buffer-drain, caught before insolvency)
   sse: new Set(),
 };
 
@@ -147,13 +148,14 @@ function loadState() {
     S.custodyHighWater = j.custodyHighWater || 0;
     S.driftAccum = j.driftAccum || {};
     S.driftAccumAt = j.driftAccumAt || 0;
+    S.solvencyBuffer = j.solvencyBuffer || { accum: 0, lastSurplus: null, lastAt: 0, alertAt: 0 };
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
     S.lastWeeklyUnix = j.lastWeeklyUnix || 0;
     S.lastSavedAt = j.savedAt || 0;           // to detect how long the daemon was down across a restart
   } catch (e) {}
 }
 function saveState() {
-  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, knownSettlers: S.knownSettlers, settlerSeeded: S.settlerSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastHourlySummary: S.lastHourlySummary, custodyHighWater: S.custodyHighWater, driftAccum: S.driftAccum, driftAccumAt: S.driftAccumAt, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
+  const data = JSON.stringify({ vaultState: S.vaultState, alertsActive: S.alertsActive, alertsLog: S.alertsLog.slice(-200), sweepBal: S.sweepBal, dynamic: S.dynamic, govBaseline: S.govBaseline, govChanges: S.govChanges.slice(-100), conservation: S.conservation, reconKnown: S.reconKnown, reconSeeded: S.reconSeeded, authorizedUpgrades: S.authorizedUpgrades.slice(-50), wAlertFrom: S.wAlertFrom, wAlertSent: S.wAlertSent.slice(-20000), wFreshToken: S.wFreshToken, wSummaryLast: S.wSummaryLast, knownPrograms: S.knownPrograms, progSeeded: S.progSeeded, knownSettlers: S.knownSettlers, settlerSeeded: S.settlerSeeded, probeClusterKey: S.probeClusterKey, containment: { trips: S.containment.trips, lastTrip: S.containment.lastTrip }, liveStatusMsgId: S.liveStatusMsgId, lastHourlySummary: S.lastHourlySummary, custodyHighWater: S.custodyHighWater, driftAccum: S.driftAccum, driftAccumAt: S.driftAccumAt, solvencyBuffer: S.solvencyBuffer, lastDigestUnix: S.lastDigestUnix, lastWeeklyUnix: S.lastWeeklyUnix, savedAt: now() }, null, 2);
   // ATOMIC write: a crash mid-write must never leave a half-written state file (which would wipe the sent-
   // history on reboot and re-send withdrawals). Write to a temp file, then rename — rename is atomic on the
   // volume's filesystem, so readers only ever see a complete file.
@@ -639,6 +641,52 @@ async function checkGovernance() {
   S.govBaseline = gov;
 }
 
+// ---------------- solvency-buffer watch (cross-domain unbacked-outflow catcher — the AFX buffer-drain) ----------------
+// Neither proof alone sees this: conservation proves base-chain movement is internally consistent (it's
+// auth-AGNOSTIC — a valid-signature drain still "conserves"), and the census proves the vault currently holds
+// AT LEAST its obligations (`vault >= owned`) — which stays TRUE while a $190k surplus buffer is eaten dollar by
+// dollar. So a drain that leaves the vault still ≥ obligations (by shrinking the margin) is invisible to both
+// until the last dollar. This closes the gap by tying the census surplus (backing − obligations) to the REAL
+// base-chain outflow: money that leaves WITHOUT obligations falling to match is unbacked. Proven inputs only.
+const SOLV_BUFFER_FLOOR = Number(process.env.SOLVENCY_BUFFER_FLOOR_USD || 50000); // accumulator floor before alarming
+const SOLV_BUFFER_CAP = Number(process.env.SOLVENCY_BUFFER_CAP_USD || 2000000);   // accumulator ceiling (sanity bound)
+// Net priced base outflow across ALL vaults since `sinceUnix`, excluding internal authority↔authority reshuffles
+// (both legs authority-owned → no real backing left the protocol). Real tokens only; marks move none of this.
+function netVaultOutflowSince(sinceUnix) {
+  const auth = S.authority; let out = 0, inn = 0;
+  for (const e of S.events) {
+    if (e.blockTime == null || e.blockTime < sinceUnix) continue;
+    if (auth && e.wallet === auth) continue;            // vault↔vault internal move — not a real outflow
+    const usd = e.usd; if (usd == null || !Number.isFinite(usd)) continue;
+    if (e.direction === "out") out += usd; else if (e.direction === "in") inn += usd;
+  }
+  return Math.max(0, out - inn);
+}
+async function checkSolvencyBuffer(inv, t) {
+  const s = inv.surplusUsd;
+  if (s == null || !Number.isFinite(s)) return;         // surplus not readable this scan → skip (never guess)
+  const B = S.solvencyBuffer;
+  const netOut = B.lastAt ? netVaultOutflowSince(B.lastAt) : 0; // real money out since the previous census poll
+  const step = reconwatch.solvencyStep({ accum: B.accum, lastSurplus: B.lastSurplus }, s, netOut, SOLV_BUFFER_CAP);
+  B.accum = step.accum; B.lastSurplus = step.lastSurplus; B.lastAt = t;
+  if (step.contribution > 0) log(`SOLVENCY-BUFFER: surplus $${Math.round(s).toLocaleString()} netOut $${Math.round(netOut).toLocaleString()} → +$${Math.round(step.contribution).toLocaleString()} unbacked (accum $${Math.round(B.accum).toLocaleString()}/${SOLV_BUFFER_FLOOR})`);
+  if (B.accum >= SOLV_BUFFER_FLOOR && (!B.alertAt || t - B.alertAt > 1800)) {
+    B.alertAt = t;
+    const deficitNow = inv.deficit != null && Number(inv.deficit) > 0;
+    const delivered = !SECURITY_ALERTS() || await sendSecurityAlert(
+      `${deficitNow ? "🔴🔴" : "🟠"}  SECURITY · FLASH V2 ${deficitNow ? "🔴🔴" : ""}\n━━━━━━━━━━━━━━━━━━━━\nSOLVENCY BUFFER ERODING — UNBACKED OUTFLOW\n\n` +
+      `≈ $${Math.round(B.accum).toLocaleString()} has left the vaults WITHOUT the protocol's obligations falling to match — the solvency margin is being eaten.\n\n` +
+      `Current backing surplus: $${Math.round(s).toLocaleString()} (backing $${Math.round(inv.vaultUsd || 0).toLocaleString()} − obligations $${Math.round(inv.ownedUsd || 0).toLocaleString()}).\n\n` +
+      `A legit withdrawal drops backing AND obligations together (buffer stays flat); a market move changes the buffer but moves no tokens. This is neither — real tokens left while obligations held, the fingerprint of an over-withdrawal / unbacked drain eating the margin BEFORE it shows as insolvency.\n\n` +
+      `${deficitNow ? "🔴 The census now ALSO shows a deficit — the buffer is gone and it's a live drain. ACT NOW." : "Census still shows solvency (buffer not yet exhausted) — VERIFY these withdrawals are entitled NOW, before the margin is spent."}\n\n🔗 flashtrade-v2-onchain-census.vercel.app`);
+    if (delivered) { log(`SOLVENCY-BUFFER ALARM sent — accum $${Math.round(B.accum)} deficitNow=${deficitNow}`); }
+    else { B.alertAt = 0; } // un-missable: undelivered → re-fire next poll
+  }
+  // full recovery → clear the accumulator so a later, unrelated erosion starts clean
+  if (B.accum < SOLV_BUFFER_FLOOR * 0.2 && B.alertAt) B.alertAt = 0;
+  saveState();
+}
+
 // ---------------- reconciliation-anomaly watch (the 7-day-rehearsal catcher) ----------------
 // Poll the census basket-vs-market reconciliation and alert on the FIRST appearance of a phantom position
 // (a Market whose open-interest no longer matches the sum of the baskets behind it). A phantom is the
@@ -671,7 +719,8 @@ async function checkReconciliation() {
   const t = now();
   const stale = inv.asOfUnix != null && (t - inv.asOfUnix) > 1800; // census scan older than 30m → not a live witness
   S.reconStatus = { mismatched: recon.mismatchedCount, marketSides: recon.marketSides, allExact: recon.allExact, checkedAt: t,
-    solvency: { present: inv.present, allHold: inv.allHold, fails: inv.fails, asOfUnix: inv.asOfUnix, stale, coveragePct: inv.coveragePct, deficit: inv.deficit } };
+    solvency: { present: inv.present, allHold: inv.allHold, fails: inv.fails, asOfUnix: inv.asOfUnix, stale, coveragePct: inv.coveragePct, deficit: inv.deficit,
+      surplusUsd: inv.surplusUsd, vaultUsd: inv.vaultUsd, ownedUsd: inv.ownedUsd, unbackedAccum: S.solvencyBuffer.accum } };
 
   // ---- PROTOCOL SOLVENCY INVARIANTS (the single strongest signal) ----
   // If the census's own on-chain invariants FAIL, the protocol is provably insolvent / being drained. CRITICAL,
@@ -689,6 +738,9 @@ async function checkReconciliation() {
       log("RECON — census solvency invariants hold again");
       if (SECURITY_ALERTS()) sendSecurityAlert(`🟢  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nSOLVENCY RESTORED\n\nAll on-chain census invariants hold again (${inv.coveragePct || "?"} coverage).`);
     }
+    // cross-domain unbacked-outflow watch: pair the surplus buffer against real base outflow (catches an AFX-style
+    // drain eating the solvency margin while `vault >= owned` still holds — before it registers as insolvency).
+    try { await checkSolvencyBuffer(inv, t); } catch (e) { S.cycleErrors.push("solvbuffer: " + (e.message || e)); }
   }
 
   // Cold start: silently baseline whatever phantom mismatch already exists so a pre-existing one is never fired
