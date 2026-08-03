@@ -42,7 +42,7 @@ Three layers. Every alarm is **verified on-chain before it fires** — never a r
 │  LAYER 1 · ATTACK DETECTION          proven-only, verified before alarm   │
 │    • Over-withdrawal ....... full lifetime history traced on-chain         │
 │    • Fresh-program deploy .. the program's actual deploy slot, read live   │
-│    • Coordinated probes .... disposable wallets + a shared funder, proven  │
+│    • Coordinated probes .... disposable wallets + proven inbound funding  │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  LAYER 2 · CONTINUOUS INTEGRITY      re-proven every ~10 seconds           │
 │    • Conservation (raw u64) . baseline + Σ deltas == balance, 0 tolerance  │

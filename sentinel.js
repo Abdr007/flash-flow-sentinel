@@ -32,6 +32,7 @@ const quorum = require("./lib/quorum.cjs");
 const { deliverAlert, heartbeat, sendTelegram, sendOperator, sendSecurityAlert, sendWithdrawalNotice, sendOrEditLiveStatus, channelsConfigured } = require("./lib/notify.cjs");
 const containment = require("./lib/containment.cjs"); // Layer 3 — proof-gated auto-containment
 const reconwatch = require("./lib/reconwatch.cjs");
+const probeorigin = require("./lib/probeorigin.cjs"); // funder attribution for the probe-cluster proof
 
 // ---------------- config ----------------
 const ER_URL = process.env.ER_URL || "https://flashtrade.magicblock.app";
@@ -1160,41 +1161,73 @@ async function checkSettlementSigners() {
 
 let probeBusy = false;
 const PROBE_FRESH_TX_MAX = Number(process.env.PROBE_FRESH_TX_MAX || 50); // a disposable rehearsal wallet has few lifetime txs
-// Trace a wallet's on-chain ORIGIN: its lifetime tx count (freshness) + FUNDER (the account that sent it the most
-// SOL in its earliest transaction). Cached in-memory (re-traced on restart; only runs when a cluster exists → rare).
+// Fan-out guard: a shared fee payer serves an open-ended user base; an attacker's funder serves a handful.
+const PROBE_FANOUT_WINDOW = Number(process.env.PROBE_FANOUT_WINDOW || 500); // signature window the sample is spread across
+const PROBE_FANOUT_SAMPLE = Number(process.env.PROBE_FANOUT_SAMPLE || 20);   // txs sampled from that window
+const PROBE_FANOUT_MAX = Number(process.env.PROBE_FANOUT_MAX || 10);         // ≥ this many distinct co-signers → infrastructure
+// Trace a wallet's on-chain ORIGIN: its lifetime tx count (freshness) + the account that provably SENT IT SOL in
+// its earliest transaction (null when nobody did — a fee-sponsored wallet has no funder). Attribution logic and the
+// fee-payer/funder distinction live in lib/probeorigin.cjs. Cached in-memory (re-traced on restart; rare).
 async function getOrigin(wallet) {
   if (S.probeFunders[wallet] !== undefined) return S.probeFunders[wallet];
-  let funder = null, txCount = null;
+  let o = { funder: null, sponsor: null, lamportsIn: null, reason: "trace-failed", txCount: null };
   try {
     const sig = await main("getSignaturesForAddress", [wallet, { limit: 1000 }]);
     const list = (sig && sig.result) || [];
-    txCount = list.length >= 1000 ? 1000 : list.length; // 1000 = capped (established); exact otherwise
+    const txCount = list.length >= 1000 ? 1000 : list.length; // 1000 = capped (established); exact otherwise
+    o.txCount = txCount;
     if (list.length) {
       const oldest = list[list.length - 1].signature; // last = earliest
-      const tx = await main("getTransaction", [oldest, { maxSupportedTransactionVersion: 0 }]);
-      const t = tx && tx.result;
-      if (t && t.meta && t.transaction) {
-        const keys = t.transaction.message.accountKeys.map((k) => (typeof k === "string" ? k : k.pubkey));
-        const pre = t.meta.preBalances || [], post = t.meta.postBalances || [];
-        let maxDrop = 0;
-        for (let i = 0; i < keys.length; i++) {
-          const drop = (pre[i] || 0) - (post[i] || 0); // lamports this account paid out
-          if (keys[i] !== wallet && drop > maxDrop) { maxDrop = drop; funder = keys[i]; }
-        }
-      }
+      // jsonParsed so an actual System transfer to the wallet is visible, not just balance deltas
+      const tx = await main("getTransaction", [oldest, { maxSupportedTransactionVersion: 0, encoding: "jsonParsed" }]);
+      o = { ...probeorigin.attributeFunder(tx && tx.result, wallet), txCount };
     }
   } catch (e) {}
-  const o = { funder, txCount };
   S.probeFunders[wallet] = o; // cache (null funder too) so we don't retrace
   return o;
 }
 
+// Distinct wallets a candidate funder co-signs for, sampled across its history.
+// Only runs when a cluster is otherwise about to alarm, so the RPC cost is rare and bounded.
+async function funderFanout(funder) {
+  const cos = new Set();
+  try {
+    // Sample EVENLY ACROSS HISTORY, never the most recent N. A cluster is flagged immediately after a
+    // batch, so the newest transactions are temporally clustered on the same few wallets by construction
+    // — measuring fan-out there understates it badly (measured: 6 distinct in the newest 20 vs ~136 across
+    // history for the same relayer). Spreading the sample is what makes this guard mean anything.
+    const sig = await main("getSignaturesForAddress", [funder, { limit: PROBE_FANOUT_WINDOW }]);
+    const all = (sig && sig.result) || [];
+    const step = Math.max(1, Math.floor(all.length / PROBE_FANOUT_SAMPLE));
+    const list = [];
+    for (let i = 0; i < all.length && list.length < PROBE_FANOUT_SAMPLE; i += step) list.push(all[i]);
+    for (const s of list) {
+      const tx = await main("getTransaction", [s.signature, { maxSupportedTransactionVersion: 0, encoding: "jsonParsed" }]);
+      const t = tx && tx.result;
+      if (!t || !t.transaction) continue;
+      const msg = t.transaction.message;
+      const keys = probeorigin.keysOf(t);
+      const hdr = msg.header && msg.header.numRequiredSignatures != null ? msg.header.numRequiredSignatures : 0;
+      keys.slice(0, hdr || keys.length).forEach((k, i) => {
+        const signer = msg.accountKeys && msg.accountKeys[i] && typeof msg.accountKeys[i] === "object"
+          ? msg.accountKeys[i].signer : i < hdr;
+        if (signer && k && k !== funder) cos.add(k);
+      });
+    }
+  } catch (e) {}
+  return cos.size;
+}
+
 // PROVEN-ONLY probe-cluster. Tiny deposit→withdraw round-trips look IDENTICAL to legit resumption testing, so the
-// pattern alone NEVER alarms. Two independent on-chain proofs must BOTH hold before we alarm:
-//   (1) the wallets are genuinely FRESH/disposable on-chain (≤PROBE_FRESH_TX_MAX lifetime txs) — not real traders/MMs, and
-//   (2) ≥3 of those fresh wallets share a single common FUNDER — the coordination fingerprint (one entity spun them up).
-// Established wallets (hundreds of txs) that merely share an exchange/MM funder are excluded by (1); independently
-// funded fresh testers are excluded by (2). Only a genuinely coordinated disposable-wallet cluster survives.
+// pattern alone NEVER alarms. Three on-chain proofs must ALL hold before we alarm:
+//   (1) the wallets are genuinely FRESH/disposable on-chain (≤PROBE_FRESH_TX_MAX lifetime txs) — not real traders/MMs,
+//   (2) ≥3 of those fresh wallets were each provably SENT SOL by one common FUNDER (see lib/probeorigin.cjs —
+//       paying a wallet's fees or account rent is NOT funding it), and
+//   (3) that funder is not a wide-fan-out relayer serving an open-ended user base.
+//
+// (1) and (2) are NOT independent, which is what produced the 2026-07-27 false positive: under fee sponsorship every
+// new user is simultaneously low-tx-count and shares the relayer as "funder", so the two proofs were one artifact
+// counted twice. (2) now demands inbound lamports and (3) separates infrastructure from coordination.
 async function checkProbeCluster(ev) {
   if (!SECURITY_ALERTS() || probeBusy) return;
   const probes = (ev && ev.probes) || [];
@@ -1216,17 +1249,26 @@ async function checkProbeCluster(ev) {
       if (freshCount) log(`probe-check: ${freshCount} fresh probe wallet(s) but no common funder ≥3 → silent (not coordinated)`);
       return;
     }
+    // PROOF 3: the shared source must not be shared INFRASTRUCTURE. A relayer/sponsor co-signs for an
+    // open-ended user base; a real attacker's funder serves only the wallets it spun up. Without this,
+    // any fee-sponsoring protocol reads as one giant permanent "cluster".
+    const fanout = await funderFanout(topFunder);
+    if (probeorigin.isSharedInfrastructure(fanout, group.length, PROBE_FANOUT_MAX)) {
+      if (S.probeClusterKey) { S.probeClusterKey = null; saveState(); }
+      log(`probe-check: ${group.length} fresh wallets share ${topFunder.slice(0, 6)}… but it co-signs for ${fanout}+ distinct wallets → shared infrastructure (relayer/sponsor), silent`);
+      return;
+    }
     const key = topFunder + ":" + group.length;
     if (S.probeClusterKey === key) return; // already alerted this exact cluster
     S.probeClusterKey = key; saveState();
     let funderN = "?"; // funder size, for the operator's judgement
     try { const s = await main("getSignaturesForAddress", [topFunder, { limit: 1000 }]); const n = ((s && s.result) || []).length; funderN = n >= 1000 ? "1000+" : String(n); } catch (e) {}
-    log(`🔴 COORDINATED PROBE CLUSTER: ${group.length} FRESH wallets (≤${PROBE_FRESH_TX_MAX} txs) share funder ${topFunder}`);
+    log(`🔴 COORDINATED PROBE CLUSTER: ${group.length} FRESH wallets (≤${PROBE_FRESH_TX_MAX} txs) funded by ${topFunder} (fan-out ${fanout})`);
     sendSecurityAlert(
       `🔴  SECURITY · FLASH V2\n━━━━━━━━━━━━━━━━━━━━\nCOORDINATED PROBE CLUSTER\n\n` +
-      `${group.length} freshly-created wallets (each <${PROBE_FRESH_TX_MAX} lifetime txs) running tiny deposit→withdraw round-trips are ALL funded by ONE source:\n${topFunder}\n(funder ≈ ${funderN} txs)\n\n` +
+      `${group.length} freshly-created wallets (each <${PROBE_FRESH_TX_MAX} lifetime txs) running tiny deposit→withdraw round-trips were each SENT SOL by ONE source:\n${topFunder}\n(funder ≈ ${funderN} txs, co-signs for ~${fanout} distinct wallets)\n\n` +
       `Wallets: ${group.slice(0, 5).map((w) => w.slice(0, 6) + "…").join(", ")}${group.length > 5 ? " …" : ""}\n\n` +
-      `⚠️ PROVEN on-chain (two independent signals): disposable wallets + single common funder + dust round-trips = the exact exploit-rehearsal fingerprint. This is NOT resumption testing. Investigate now.`
+      `⚠️ Verified on-chain: each wallet provably RECEIVED SOL from this source (fee sponsorship excluded), the source is not a wide-fan-out relayer, and all are disposable wallets running dust round-trips. Investigate.`
     );
   } finally { probeBusy = false; }
 }
