@@ -32,6 +32,7 @@ const quorum = require("./lib/quorum.cjs");
 const { deliverAlert, heartbeat, sendTelegram, sendOperator, sendSecurityAlert, sendWithdrawalNotice, sendOrEditLiveStatus, channelsConfigured } = require("./lib/notify.cjs");
 const containment = require("./lib/containment.cjs"); // Layer 3 — proof-gated auto-containment
 const reconwatch = require("./lib/reconwatch.cjs");
+const backing = require("./lib/backing.cjs"); // settlement-lag-safe unbacked-outflow reconciliation
 const probeorigin = require("./lib/probeorigin.cjs"); // funder attribution for the probe-cluster proof
 
 // ---------------- config ----------------
@@ -112,8 +113,8 @@ const S = {
   custodyHighWater: 0,     // most vaults ever seen in one scan (persisted → a flaky boot can't lower the bar; coverage-shrink guard)
   driftAccum: {},          // wallet → cumulative net outflow USD, persisted ACROSS event pruning — slow-drip nominator for the proof
   driftAccumAt: 0,         // watermark blockTime up to which drift has been accumulated
-  solvencyBuffer: { accum: 0, lastSurplus: null, lastAt: 0, alertAt: 0 }, // cross-domain unbacked-outflow watch (coarse USD aggregate; FALLBACK when per-custody data absent)
-  custodyBacking: {},      // custody → { lastResidualHuman, lastAt, accumUsd } — PRECISE per-custody raw (mark-free) unbacked-outflow reconciliation; the deepest layer
+  solvencyBuffer: { s: [], alertAt: 0, unbackedUsd: 0, ready: false }, // cross-domain unbacked-outflow watch (coarse USD aggregate; FALLBACK when per-custody data absent)
+  custodyBacking: {},      // custody → { s: [[unix, residualHuman], …], unbackedUsd, ready } — PRECISE per-custody raw (mark-free) unbacked-outflow reconciliation; the deepest layer
   ownSolvency: { allSolvent: null, deficit: 0, backed: 0, custodyCount: 0, totalDeficitRaw: "0", complete: false, asOf: 0, defStreak: 0, disStreak: 0, defAlertAt: 0, disAlertAt: 0 }, // the sentinel's OWN independent solvency recompute (2nd witness) + cross-witness state
   quorum: { facts: null, checkedAt: 0, streak: {}, alertAt: {} }, // cross-provider quorum on crown-jewel base-chain facts (stale/compromised-RPC guard; degradation-safe)
   sse: new Set(),
@@ -154,8 +155,11 @@ function loadState() {
     S.custodyHighWater = j.custodyHighWater || 0;
     S.driftAccum = j.driftAccum || {};
     S.driftAccumAt = j.driftAccumAt || 0;
-    S.solvencyBuffer = j.solvencyBuffer || { accum: 0, lastSurplus: null, lastAt: 0, alertAt: 0 };
+    // migrate(): a state file written by the old rectified accumulator carries an `accumUsd`/`accum`
+    // that is not a buffer LEVEL and cannot be converted — drop it and rebuild the series.
+    S.solvencyBuffer = backing.migrate(j.solvencyBuffer || { s: [], alertAt: 0 });
     S.custodyBacking = j.custodyBacking || {};
+    for (const k of Object.keys(S.custodyBacking)) S.custodyBacking[k] = backing.migrate(S.custodyBacking[k]);
     S.ownSolvency = j.ownSolvency || S.ownSolvency;
     S.quorum = j.quorum || S.quorum;
     S.lastDigestUnix = j.lastDigestUnix || 0; // don't re-send the digest on every restart
@@ -657,8 +661,13 @@ async function checkGovernance() {
 // dollar. So a drain that leaves the vault still ≥ obligations (by shrinking the margin) is invisible to both
 // until the last dollar. This closes the gap by tying the census surplus (backing − obligations) to the REAL
 // base-chain outflow: money that leaves WITHOUT obligations falling to match is unbacked. Proven inputs only.
-const SOLV_BUFFER_FLOOR = Number(process.env.SOLVENCY_BUFFER_FLOOR_USD || 50000); // accumulator floor before alarming
-const SOLV_BUFFER_CAP = Number(process.env.SOLVENCY_BUFFER_CAP_USD || 2000000);   // accumulator ceiling (sanity bound)
+const SOLV_BUFFER_FLOOR = Number(process.env.SOLVENCY_BUFFER_FLOOR_USD || 50000); // unbacked USD before alarming
+const SOLV_BUFFER_CAP = Number(process.env.SOLVENCY_BUFFER_CAP_USD || 2000000);   // reported-figure ceiling (sanity bound)
+// Window the backing buffer's SETTLED level is compared across. It must comfortably exceed the ER→base
+// settlement lag, otherwise the two legs of an ordinary withdrawal fall on opposite ends of the window and
+// the swing reads as a drain — the 2026-08-03 false positive. 6h against a lag measured in minutes.
+const BACKING_WINDOW_S = Number(process.env.BACKING_WINDOW_S || backing.DEFAULT_WINDOW_S);
+const BACKING_SAMPLE_GAP_S = Number(process.env.BACKING_SAMPLE_GAP_S || backing.DEFAULT_SAMPLE_GAP_S);
 // Net priced base outflow across ALL vaults since `sinceUnix`, excluding internal authority↔authority reshuffles
 // (both legs authority-owned → no real backing left the protocol). Real tokens only; marks move none of this.
 function netVaultOutflowSince(sinceUnix) {
@@ -683,70 +692,96 @@ function custodyNetOutflowUsdSince(custodyAcct, sinceUnix) {
   }
   return Math.max(0, out - inn);
 }
-// PRECISE per-custody unbacked-outflow reconciliation (the deepest layer). For EACH custody, pair its mark-free
-// raw surplus buffer (census withdrawableResidual, token units) against that custody's OWN base outflow, per poll
-// interval — so a drain on custody A can't be masked by surplus on custody B, and marks (which move no tokens and
-// don't touch realized `owned`) contribute nothing. Fires with exact attribution: which custody, which vault, how
-// much unbacked. Returns true if it ran (per-custody data present) so the coarse USD aggregate can defer alarming.
+// PRECISE per-custody unbacked-outflow reconciliation (the deepest layer). For EACH custody, compare its mark-free
+// raw backing buffer (census withdrawableResidual, token units) NOW against its level one window ago, and bound the
+// difference by that custody's OWN base outflow over the same window — so a drain on custody A can't be masked by
+// surplus on custody B, and marks (which move no tokens and don't touch realized `owned`) contribute nothing.
+//
+// The comparison is median-of-quarters, NOT a per-poll delta. Flash V2 withdrawals settle in two legs across two
+// clocks (custody accounting on the ER, the SPL transfer later on base chain), so the buffer transiently rises
+// then falls back on every ordinary withdrawal. Stepping per poll and flooring at zero booked that entire swing as
+// unbacked — the 2026-08-03 false positive, where one entitled $66,768.90 RemoveLiquiditySettle LP redemption was
+// reported as "$66,760 unbacked" on Governance.1/USDC. See lib/backing.cjs for the full derivation.
+//
+// Fires with exact attribution: which custody, which vault, how much unbacked, and the two buffer levels behind it.
+// Returns true if it ran (per-custody data present) so the coarse USD aggregate can defer alarming.
 async function checkCustodyBacking(rows, inv, t) {
   if (!Array.isArray(rows) || !rows.length) return false; // census predates custodyMap → caller uses USD fallback
-  let totalUnbacked = 0; const offenders = [];
+  let totalUnbacked = 0; const offenders = []; let ready = 0;
   for (const r of rows) {
     const resid = r.residualHuman, mark = r.markPrice;
     if (!Number.isFinite(resid)) continue;
-    const st = S.custodyBacking[r.custody] || { lastResidualHuman: null, lastAt: 0, accumUsd: 0 };
-    if (st.lastResidualHuman != null && mark != null) {
-      const dropHuman = st.lastResidualHuman - resid;                     // >0 = this custody's buffer shrank (token units)
-      const outUsd = st.lastAt ? custodyNetOutflowUsdSince(r.custody, st.lastAt) : 0; // real tokens that left THIS custody
-      if (dropHuman > 0 && outUsd > 0) st.accumUsd = Math.max(0, (st.accumUsd || 0) + Math.min(outUsd, dropHuman * mark));
-      if (dropHuman < 0) st.accumUsd = Math.max(0, (st.accumUsd || 0) - (-dropHuman) * mark); // recovery decays
-    }
-    st.accumUsd = Math.min(st.accumUsd || 0, SOLV_BUFFER_CAP);
-    st.lastResidualHuman = resid; st.lastAt = t;
+    const st = backing.migrate(S.custodyBacking[r.custody]);
+    backing.pushSample(st, t, resid, BACKING_SAMPLE_GAP_S);
+    backing.prune(st, t, BACKING_WINDOW_S);
+    // Real money that left THIS custody across the SAME window the buffer is measured over.
+    const netOutUsd = custodyNetOutflowUsdSince(r.custody, t - BACKING_WINDOW_S);
+    const ev = backing.evaluate(st, { now: t, windowS: BACKING_WINDOW_S, mark, netOutUsd, cap: SOLV_BUFFER_CAP });
+    st.unbackedUsd = ev.unbackedUsd; st.ready = ev.ready; st.reason = ev.reason;
     S.custodyBacking[r.custody] = st;
-    if (st.accumUsd > 0) { totalUnbacked += st.accumUsd; offenders.push({ sym: r.symbol, pool: r.pool, vault: r.vault, accumUsd: st.accumUsd, status: r.vaultStatus }); }
+    if (ev.ready) ready++;
+    if (ev.unbackedUsd > 0) {
+      totalUnbacked += ev.unbackedUsd;
+      offenders.push({ sym: r.symbol, pool: r.pool, vault: r.vault, unbackedUsd: ev.unbackedUsd, status: r.vaultStatus, baseline: ev.baseline, current: ev.current });
+    }
   }
-  offenders.sort((a, b) => b.accumUsd - a.accumUsd);
-  const maxOne = offenders.length ? offenders[0].accumUsd : 0;
-  const fire = maxOne >= SOLV_BUFFER_FLOOR || totalUnbacked >= SOLV_BUFFER_FLOOR;
-  if (fire && (!S._custBackAlertAt || t - S._custBackAlertAt > 1800)) {
+  offenders.sort((a, b) => b.unbackedUsd - a.unbackedUsd);
+  const maxOne = offenders.length ? offenders[0].unbackedUsd : 0;
+  const over = maxOne >= SOLV_BUFFER_FLOOR || totalUnbacked >= SOLV_BUFFER_FLOOR;
+  // 2-poll streak: the settled-level comparison is already transient-proof, but a census scan that lands
+  // mid-settlement on BOTH ends of the window is cheap to rule out by simply seeing it twice.
+  S._custBackStreak = over ? (S._custBackStreak || 0) + 1 : 0;
+  if (over && S._custBackStreak >= 2 && (!S._custBackAlertAt || t - S._custBackAlertAt > 1800)) {
     S._custBackAlertAt = t;
     const deficitNow = inv.deficit != null && Number(inv.deficit) > 0;
-    const top = offenders.slice(0, 5).map((o) => `• ${o.pool}/${o.sym}: ~$${Math.round(o.accumUsd).toLocaleString()} unbacked${o.status === "deficit" ? " (DEFICIT)" : ""} · vault ${String(o.vault).slice(0, 6)}…`).join("\n");
+    const hrs = (BACKING_WINDOW_S / 3600).toFixed(0);
+    const top = offenders.slice(0, 5).map((o) =>
+      `• ${o.pool}/${o.sym}: ~$${Math.round(o.unbackedUsd).toLocaleString()} unbacked${o.status === "deficit" ? " (DEFICIT)" : ""}\n  buffer ${Number(o.baseline).toFixed(2)} → ${Number(o.current).toFixed(2)} · vault ${String(o.vault).slice(0, 6)}…`).join("\n");
     const delivered = !SECURITY_ALERTS() || await sendSecurityAlert(
       `${deficitNow ? "🔴🔴" : "🟠"}  SECURITY · FLASH V2 ${deficitNow ? "🔴🔴" : ""}\n━━━━━━━━━━━━━━━━━━━━\nUNBACKED OUTFLOW — PER-CUSTODY (raw, mark-free)\n\n` +
-      `≈ $${Math.round(totalUnbacked).toLocaleString()} has left specific custodies WITHOUT their on-chain obligations falling to match — reconciled per-custody in raw token units (immune to price marks):\n\n${top}\n\n` +
-      `A legit withdrawal drops a custody's vault AND its owned/payable together (its buffer stays flat); this didn't — real tokens left while the custody's accounting held, the exact fingerprint of an over-withdrawal on that custody.\n\n` +
+      `≈ $${Math.round(totalUnbacked).toLocaleString()} of real tokens have left specific custodies WITHOUT their on-chain obligations falling to match:\n\n${top}\n\n` +
+      `Measured in raw token units (immune to price marks): each custody's SETTLED backing buffer now vs ${hrs}h ago — median of each end, so the two-leg ER→base settlement swing on an ordinary withdrawal cannot register — bounded by the money that actually left that custody in the same window.\n\n` +
+      `An entitled withdrawal moves the vault AND that custody's obligations by the same amount once both legs settle, so its buffer returns to where it was. These did not return: the settled level itself fell while real tokens left.\n\n` +
       `${deficitNow ? "🔴 The census ALSO shows a vault deficit now — live drain. ACT NOW." : "Census still solvent overall (buffers not yet exhausted) — VERIFY these specific withdrawals are entitled NOW."}\n\n🔗 flashtrade-v2-onchain-census.vercel.app`);
     if (delivered) log(`CUSTODY-BACKING ALARM sent — $${Math.round(totalUnbacked)} unbacked across ${offenders.length} custody(ies), top ${offenders[0].pool}/${offenders[0].sym} deficitNow=${deficitNow}`);
-    else S._custBackAlertAt = 0; // un-missable: undelivered → re-fire next poll
+    else { S._custBackAlertAt = 0; S._custBackStreak = 1; } // un-missable: undelivered → re-fire next poll
   }
   if (totalUnbacked < SOLV_BUFFER_FLOOR * 0.2 && S._custBackAlertAt) S._custBackAlertAt = 0;
+  S._custBackReady = ready;
   saveState();
   return true;
 }
+// Coarse USD aggregate over the protocol-wide surplus — same settled-level comparison, one series instead of many.
+// FALLBACK only: stays silent (track-only) whenever the precise per-custody pass ran.
 async function checkSolvencyBuffer(inv, t, silent) {
   const s = inv.surplusUsd;
   if (s == null || !Number.isFinite(s)) return;         // surplus not readable this scan → skip (never guess)
-  const B = S.solvencyBuffer;
-  const netOut = B.lastAt ? netVaultOutflowSince(B.lastAt) : 0; // real money out since the previous census poll
-  const step = reconwatch.solvencyStep({ accum: B.accum, lastSurplus: B.lastSurplus }, s, netOut, SOLV_BUFFER_CAP);
-  B.accum = step.accum; B.lastSurplus = step.lastSurplus; B.lastAt = t;
-  if (step.contribution > 0) log(`SOLVENCY-BUFFER${silent ? " (track-only)" : ""}: surplus $${Math.round(s).toLocaleString()} netOut $${Math.round(netOut).toLocaleString()} → +$${Math.round(step.contribution).toLocaleString()} unbacked (accum $${Math.round(B.accum).toLocaleString()}/${SOLV_BUFFER_FLOOR})`);
-  if (!silent && B.accum >= SOLV_BUFFER_FLOOR && (!B.alertAt || t - B.alertAt > 1800)) {
+  const B = backing.migrate(S.solvencyBuffer);
+  backing.pushSample(B, t, s, BACKING_SAMPLE_GAP_S);
+  backing.prune(B, t, BACKING_WINDOW_S);
+  const netOut = netVaultOutflowSince(t - BACKING_WINDOW_S); // real money out across the SAME window
+  // surplusUsd is already USD, so mark = 1.
+  const ev = backing.evaluate(B, { now: t, windowS: BACKING_WINDOW_S, mark: 1, netOutUsd: netOut, cap: SOLV_BUFFER_CAP });
+  B.unbackedUsd = ev.unbackedUsd; B.ready = ev.ready; B.reason = ev.reason;
+  S.solvencyBuffer = B;
+  if (ev.unbackedUsd > 0) log(`SOLVENCY-BUFFER${silent ? " (track-only)" : ""}: settled surplus $${Math.round(ev.baseline).toLocaleString()} → $${Math.round(ev.current).toLocaleString()}, netOut $${Math.round(netOut).toLocaleString()} → $${Math.round(ev.unbackedUsd).toLocaleString()} unbacked (floor ${SOLV_BUFFER_FLOOR})`);
+  const over = ev.unbackedUsd >= SOLV_BUFFER_FLOOR;
+  S._solvBufStreak = over ? (S._solvBufStreak || 0) + 1 : 0;
+  if (!silent && over && S._solvBufStreak >= 2 && (!B.alertAt || t - B.alertAt > 1800)) {
     B.alertAt = t;
     const deficitNow = inv.deficit != null && Number(inv.deficit) > 0;
+    const hrs = (BACKING_WINDOW_S / 3600).toFixed(0);
     const delivered = !SECURITY_ALERTS() || await sendSecurityAlert(
       `${deficitNow ? "🔴🔴" : "🟠"}  SECURITY · FLASH V2 ${deficitNow ? "🔴🔴" : ""}\n━━━━━━━━━━━━━━━━━━━━\nSOLVENCY BUFFER ERODING — UNBACKED OUTFLOW\n\n` +
-      `≈ $${Math.round(B.accum).toLocaleString()} has left the vaults WITHOUT the protocol's obligations falling to match — the solvency margin is being eaten.\n\n` +
-      `Current backing surplus: $${Math.round(s).toLocaleString()} (backing $${Math.round(inv.vaultUsd || 0).toLocaleString()} − obligations $${Math.round(inv.ownedUsd || 0).toLocaleString()}).\n\n` +
-      `A legit withdrawal drops backing AND obligations together (buffer stays flat); a market move changes the buffer but moves no tokens. This is neither — real tokens left while obligations held, the fingerprint of an over-withdrawal / unbacked drain eating the margin BEFORE it shows as insolvency.\n\n` +
+      `≈ $${Math.round(ev.unbackedUsd).toLocaleString()} has left the vaults WITHOUT the protocol's obligations falling to match — the solvency margin is being eaten.\n\n` +
+      `Settled backing surplus ${hrs}h ago $${Math.round(ev.baseline).toLocaleString()} → now $${Math.round(ev.current).toLocaleString()} (backing $${Math.round(inv.vaultUsd || 0).toLocaleString()} − obligations $${Math.round(inv.ownedUsd || 0).toLocaleString()}), against $${Math.round(netOut).toLocaleString()} that actually left in the same window.\n\n` +
+      `An entitled withdrawal moves backing AND obligations together, so the settled buffer returns to where it was; a market move changes the buffer but moves no tokens. This is neither.\n\n` +
       `${deficitNow ? "🔴 The census now ALSO shows a deficit — the buffer is gone and it's a live drain. ACT NOW." : "Census still shows solvency (buffer not yet exhausted) — VERIFY these withdrawals are entitled NOW, before the margin is spent."}\n\n🔗 flashtrade-v2-onchain-census.vercel.app`);
-    if (delivered) { log(`SOLVENCY-BUFFER ALARM sent — accum $${Math.round(B.accum)} deficitNow=${deficitNow}`); }
-    else { B.alertAt = 0; } // un-missable: undelivered → re-fire next poll
+    if (delivered) { log(`SOLVENCY-BUFFER ALARM sent — $${Math.round(ev.unbackedUsd)} deficitNow=${deficitNow}`); }
+    else { B.alertAt = 0; S._solvBufStreak = 1; } // un-missable: undelivered → re-fire next poll
   }
-  // full recovery → clear the accumulator so a later, unrelated erosion starts clean
-  if (B.accum < SOLV_BUFFER_FLOOR * 0.2 && B.alertAt) B.alertAt = 0;
+  // full recovery → clear the latch so a later, unrelated erosion starts clean
+  if (ev.unbackedUsd < SOLV_BUFFER_FLOOR * 0.2 && B.alertAt) B.alertAt = 0;
   saveState();
 }
 
@@ -878,8 +913,11 @@ async function checkReconciliation() {
   const stale = inv.asOfUnix != null && (t - inv.asOfUnix) > 1800; // census scan older than 30m → not a live witness
   S.reconStatus = { mismatched: recon.mismatchedCount, marketSides: recon.marketSides, allExact: recon.allExact, checkedAt: t,
     solvency: { present: inv.present, allHold: inv.allHold, fails: inv.fails, asOfUnix: inv.asOfUnix, stale, coveragePct: inv.coveragePct, deficit: inv.deficit,
-      surplusUsd: inv.surplusUsd, vaultUsd: inv.vaultUsd, ownedUsd: inv.ownedUsd, unbackedAccum: S.solvencyBuffer.accum,
-      perCustodyUnbacked: Object.entries(S.custodyBacking).filter(([, v]) => v && v.accumUsd > 1).map(([c, v]) => ({ custody: c, unbackedUsd: Math.round(v.accumUsd) })),
+      surplusUsd: inv.surplusUsd, vaultUsd: inv.vaultUsd, ownedUsd: inv.ownedUsd, unbackedAccum: S.solvencyBuffer.unbackedUsd || 0,
+      // `ready` is honest coverage: a custody still building its first window reports 0 unbacked because it
+      // cannot yet be measured, NOT because it has been cleared.
+      backingWindowS: BACKING_WINDOW_S, backingReady: S._custBackReady || 0,
+      perCustodyUnbacked: Object.entries(S.custodyBacking).filter(([, v]) => v && v.unbackedUsd > 1).map(([c, v]) => ({ custody: c, unbackedUsd: Math.round(v.unbackedUsd) })),
       // the sentinel's OWN independent recompute (2nd witness) + whether it agrees with the census
       independent: { allSolvent: S.ownSolvency.allSolvent, deficit: S.ownSolvency.deficit, backed: S.ownSolvency.backed, custodyCount: S.ownSolvency.custodyCount, complete: S.ownSolvency.complete, asOf: S.ownSolvency.asOf,
         attempts: S.ownSolvency.attempts || 0, lastError: S.ownSolvency.lastError || null, lastAttemptAt: S.ownSolvency.lastAttemptAt || 0,
