@@ -1,8 +1,5 @@
-# Vercel serves ONLY the dashboard shell; everything dynamic is rewritten to Render.
-# Whitelist: ignore everything, then un-ignore the five static assets + config.
 *
-!index.html
-!app.js
+!archive.html
 !styles.css
 !favicon.png
 !flash-trade-v2.png

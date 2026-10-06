@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Flash V2 · Flow Sentinel — Archive (Mainnet)</title>
+  <meta name="description" content="Archive of Flow Sentinel, the real-time vault outflow monitor that ran on Flash Trade V2 mainnet until the protocol wound down in September 2026: what it watched, its final guard thresholds, and the record of what it caught." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="icon" type="image/png" href="./flash-trade-v2.png" />
+  <link rel="stylesheet" href="./styles.css?v=20261006" />
+  <style>
+    .archive-banner{max-width:1400px;margin:18px auto 0;padding:16px 20px;border:1px solid rgba(233,169,60,.55);border-left:4px solid #e9a93c;border-radius:10px;background:rgba(233,169,60,.07)}
+    .archive-banner-title{font-weight:800;letter-spacing:.04em;color:#e9a93c;margin-bottom:6px}
+    .archive-banner-body{font-size:.95rem;line-height:1.55;opacity:.94}
+    .archive-banner-body a{color:inherit;text-decoration:underline}
+    .tl{list-style:none;margin:10px 0 0;padding:0;border-left:2px solid var(--line-2,rgba(120,160,130,.22))}
+    .tl li{position:relative;padding:0 0 14px 18px;font-size:.93rem;line-height:1.5}
+    .tl li::before{content:"";position:absolute;left:-6px;top:7px;width:10px;height:10px;border-radius:50%;background:var(--teal,#00e08a)}
+    .tl li.warn::before{background:#e9a93c}
+    .tl li.end::before{background:#7d8c82}
+    .tl b{color:var(--ink,#e9f3ec)}
+    .tl .d{font-family:"JetBrains Mono",monospace;font-size:.8rem;color:var(--ink-faint,#7d8c82);margin-right:8px}
+    .th{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-top:10px}
+    .th div{padding:12px 14px;border:1px solid var(--line,rgba(120,160,130,.14));border-radius:10px;background:var(--panel-2,rgba(18,26,26,.6))}
+    .th .v{font-family:"JetBrains Mono",monospace;font-weight:700;font-size:1.05rem;color:var(--lime,#ccff00)}
+    .th .k{display:block;font-size:.8rem;color:var(--ink-faint,#7d8c82);margin-top:4px;line-height:1.4}
+    .status.archived .dot{background:#e9a93c;box-shadow:none;animation:none}
+    .foot{max-width:1400px;margin:24px auto 40px;padding:0 20px;font-size:.85rem;color:var(--ink-faint,#7d8c82)}
+    .foot a{color:inherit}
+  </style>
+</head>
+<body>
+  <div class="scanlines" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <img class="logo-lockup" src="./flash-trade-v2.png" alt="Flash Trade V2" />
+      <span class="brand-divider"></span>
+      <div class="brand-text">
+        <span class="brand-title">FLOW&nbsp;SENTINEL <span class="badge-net">MAINNET</span></span>
+        <span class="brand-sub">vault inflow / outflow monitor · ran July–September 2026 · archived record</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <a class="chip chip-prog" href="https://solscan.io/account/FLASH6Lo6h3iasJKWDs2F8TkW2UKf3s15C8PMGuVfgBn" target="_blank" rel="noopener" title="Flash V2 perps program">FLASH6…</a>
+      <a class="chip" href="https://github.com/Abdr007/flash-flow-sentinel" target="_blank" rel="noopener" title="Source code, public">SOURCE</a>
+      <span class="status archived"><span class="dot"></span><span>ARCHIVED</span></span>
+      <span class="asof">6 Oct 2026</span>
+    </div>
+  </header>
+
+  <section class="archive-banner">
+    <div class="archive-banner-title">ARCHIVED — Flash Trade wound down in September 2026</div>
+    <div class="archive-banner-body">
+      Flow Sentinel watched every vault of Flash Trade V2 on Solana mainnet in real time from 20 July 2026. Flash Trade announced an orderly
+      wind-down in August 2026; positions were force-closed on 2 September and withdrawals ran on 15 September, and the monitor's live capture
+      ended with the protocol. There is nothing left to guard, so this page keeps the record instead: what the monitor watched, the guard
+      thresholds it was running at the end, and what it caught. Everything here comes from the monitor's own configuration, alert log and
+      commit history. Source is public on <a href="https://github.com/Abdr007/flash-flow-sentinel" target="_blank" rel="noopener">GitHub</a>.
+    </div>
+  </section>
+
+  <main class="wrap">
+
+    <section class="card focus">
+      <div class="card-head"><h2>What it watched</h2><span class="card-tag">CAPTURE</span></div>
+      <p class="note">
+        Every custody vault of the exchange plus the TradeVault, RebateVault and FAF token vault, and a balance sweep of every token account owned by the
+        program's vault authority, so any account that moved was promoted to full per-transaction tracking automatically. Capture was push-triggered by
+        a WebSocket subscription on each vault with a baseline poll. Each transfer was decoded from the transaction's pre and post token balances to the
+        exact integer and valued in USD at the on-chain oracle mark observed at capture, with Pyth Lazer as an independent price witness and the
+        on-chain census as an independent solvency witness. No external trading API and no synthetic data anywhere.
+      </p>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Final guard thresholds</h2><span class="card-tag">AS CONFIGURED, 3 AUG 2026</span></div>
+      <div class="th">
+        <div><span class="v">$100,000 / hour</span><span class="k">global outflow cap across all wallets, warning at 70%</span></div>
+        <div><span class="v">$50,000 / hour</span><span class="k">per-wallet outflow cap</span></div>
+        <div><span class="v">20% / hour</span><span class="k">vault drawdown limit, net of inflows, with a $5,000 materiality floor so dust vaults cannot false-alarm</span></div>
+        <div><span class="v">1.5%</span><span class="k">oracle deviation between the exchange's mark and Pyth Lazer, only after the independent feed is confirmed fresh</span></div>
+        <div><span class="v">50× in 24h</span><span class="k">entitlement guard: a wallet withdrawing more than fifty times what it deposited, above a $10,000 floor, verified against its full on-chain history before any alarm</span></div>
+        <div><span class="v">3-of-7</span><span class="k">program-upgrade watch: the upgrade authority had to stay unchanged and under the Squads multisig, with authorized upgrades verified automatically</span></div>
+      </div>
+      <p class="note" style="margin-top:12px">
+        Every detector was labelled either a <strong>proof</strong>, verified on-chain before it could fire, or a <strong>risk limit</strong>, a heads-up when a
+        configured threshold was crossed. Only proofs could trigger the automated containment layer; risk limits only ever notified a person.
+      </p>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>The record</h2><span class="card-tag">FROM THE COMMIT HISTORY AND ALERT LOG</span></div>
+      <ul class="tl">
+        <li class="warn"><span class="d">15 Jul 2026</span><b>Why it was built.</b> A compromised oracle signer at another perps venue posted a fake BTC price and roughly $18M left its vaults in minutes.</li>
+        <li><span class="d">19–20 Jul</span><b>Built and made public.</b> Per-vault flow conservation proof (baseline plus the sum of observed deltas must equal the live balance, raw integer, every cycle), then a six-lens hardening pass: security, numeric, honesty, XSS, performance, resilience. Independent verification suite re-fetched sampled events from the chain and passed 22 of 22.</li>
+        <li class="warn"><span class="d">21 Jul</span><b>$97,988 over-withdrawal.</b> A wallet deposited $1 and withdrew $97,988 through the rollup-to-mainnet settlement path. The transfer was in the monitor's feed, and balance conservation stayed exact, because the money really moved: movement is not entitlement. The protocol team closed the path and reimbursed users.</li>
+        <li><span class="d">22 Jul</span><b>Entitlement guard and anomaly alarms.</b> Added the 50× entitlement fingerprint, a reconciliation-anomaly alarm for phantom positions, automatic verification of program upgrades, a self-healing cycle watchdog, and proven-only alarms routed to a private channel.</li>
+        <li><span class="d">23 Jul</span><b>Three-layer defense.</b> Proof-gated containment that traces a wallet's entire collateral history before responding; an independent solvency recompute as the monitor's own second witness; settlement-signer and solvency-buffer watches; the real 3-of-7 upgrade multisig under watch.</li>
+        <li><span class="d">3 Aug</span><b>A false positive, found and fixed.</b> An "unbacked outflow" alarm turned out to be the exchange's two-leg withdrawal across two clocks: rollup accounting updates instantly, the base-chain transfer settles later. The detector now compares settled levels, not per-poll deltas.</li>
+        <li class="end"><span class="d">Sep 2026</span><b>Flash Trade wind-down.</b> Positions force-closed on 2 September, withdrawals on 15 September.</li>
+        <li class="end"><span class="d">6 Oct 2026</span><b>Final read and archive.</b> The governance watch recorded the protocol's trading, liquidity and staking permission flags switched off, and the program holds no market accounts. The monitor was taken out of live service and this record published.</li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>How to trust it</h2><span class="card-tag">VERIFICATION</span></div>
+      <p class="note">
+        The dashboard never showed a confident green while blind: if a cycle stalled, the daemon was unreachable or the window was still backfilling it said
+        STALE, ARMING or RECONNECTING. A "drain" alarm needed two independent witnesses to agree. Alarms were proven on-chain before they fired and
+        went to a private channel, so a public page could not be used to manufacture panic. The raw accounting was exact to the integer and every figure
+        traced to a confirmed transaction signature. The code, tests and verification suite are public at
+        <a href="https://github.com/Abdr007/flash-flow-sentinel" target="_blank" rel="noopener">github.com/Abdr007/flash-flow-sentinel</a>.
+      </p>
+    </section>
+
+  </main>
+
+  <footer class="foot">Flow Sentinel · built by Abdul Rahman · ran on Flash Trade V2 mainnet, July to September 2026 · archived 6 October 2026 · <a href="https://abdulrahman-systems.vercel.app">abdulrahman-systems.vercel.app</a></footer>
+</body>
+</html>

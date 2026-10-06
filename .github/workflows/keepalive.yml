@@ -14,11 +14,10 @@ name: keep-alive
 # pushes a tiny dated commit twice a month so the repository never looks inactive.
 # The commit message carries [skip render] so Render does not rebuild for it.
 
+# ARCHIVED 2026-10-06: Flash Trade wound down (Sep 2026) and the public site now serves the static
+# archive page from Vercel with no Render backend, so the schedules are removed. Manual runs only.
 on:
-  schedule:
-    - cron: "*/5 * * * *"     # every 5 minutes (well under Render's ~15-min idle threshold)
-    - cron: "17 3 1,15 * *"   # 1st and 15th of each month: activity heartbeat
-  workflow_dispatch: {}       # allow a manual "wake it now" from the Actions tab
+  workflow_dispatch: {}
 
 concurrency:
   group: keepalive
