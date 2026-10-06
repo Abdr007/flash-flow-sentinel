@@ -8,14 +8,17 @@ name: keep-alive
 # GitHub Actions cron minimum is every 5 min. Scheduled runs can lag under load, so we
 # retry within a single run too — combined with the app's own 10-min self-ping, the
 # service stays warm even if one layer misses.
+#
+# IMPORTANT: GitHub silently disables scheduled workflows after 60 days without a commit
+# (this happened on 2026-10-02 and the dashboard went cold). The `heartbeat` job below
+# pushes a tiny dated commit twice a month so the repository never looks inactive.
+# The commit message carries [skip render] so Render does not rebuild for it.
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes (well under Render's ~15-min idle threshold)
+    - cron: "*/5 * * * *"     # every 5 minutes (well under Render's ~15-min idle threshold)
+    - cron: "17 3 1,15 * *"   # 1st and 15th of each month: activity heartbeat
   workflow_dispatch: {}       # allow a manual "wake it now" from the Actions tab
-
-permissions:
-  contents: read
 
 concurrency:
   group: keepalive
@@ -25,6 +28,8 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - name: Ping Render (retry until it responds)
         run: |
@@ -43,3 +48,22 @@ jobs:
           # do not fail the workflow: the retries above already generated the inbound
           # traffic that triggers the wake; a red X here would just create alert noise.
           exit 0
+
+  heartbeat:
+    # Only on the twice-monthly schedule (or a manual run). Keeps the repo "active" so
+    # GitHub does not auto-disable the cron above after 60 idle days.
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 1,15 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record heartbeat and push
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/KEEPALIVE_HEARTBEAT
+          git config user.name  "keep-alive bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add .github/KEEPALIVE_HEARTBEAT
+          git commit -m "chore: keep-alive heartbeat $(cat .github/KEEPALIVE_HEARTBEAT) [skip render] [skip ci]" || { echo "nothing to commit"; exit 0; }
+          git push
